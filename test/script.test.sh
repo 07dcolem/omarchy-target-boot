@@ -39,12 +39,12 @@ jq -e '
 dry=$("$cli" reboot-into 0001 --dry-run --fixture "$fix")
 jq -e '
   .ok == true and .dryRun == true and .action == "reboot-into" and .id == "0001"
-  and .argv == ["efibootmgr","--bootnext","0001"]
-  and (.reboot == ["omarchy-system-reboot"] or .reboot == ["systemctl","reboot","--no-wall"])
+  and .argv == ["/usr/bin/efibootmgr","--bootnext","0001"]
+  and (.reboot == ["/usr/bin/omarchy-system-reboot"] or .reboot == ["/usr/bin/systemctl","reboot","--no-wall"])
 ' <<<"$dry" >/dev/null
 
 clear_dry=$("$cli" clear-next --dry-run --fixture "$fix")
-jq -e '.ok == true and .dryRun == true and .argv == ["efibootmgr","--delete-bootnext"]' <<<"$clear_dry" >/dev/null
+jq -e '.ok == true and .dryRun == true and .argv == ["/usr/bin/efibootmgr","--delete-bootnext"]' <<<"$clear_dry" >/dev/null
 
 set +e
 bad=$("$cli" reboot-into '0001;reboot' --dry-run --fixture "$fix" 2>/dev/null)
@@ -74,13 +74,14 @@ if grep -E -n -- '--bootorder|bootctl|set-default|--create|--delete-bootnum|--ti
   exit 1
 fi
 
-# Every efibootmgr mention is a read, BootNext, or clearing BootNext.
+# Every efibootmgr mention is the pinned system path, a comment, a read, or
+# one of the two BootNext writes.
 while IFS= read -r line; do
   [[ $line == *efibootmgr* ]] || continue
   case $line in
-    *'command -v efibootmgr'*|*'efibootmgr was not found'*|*'efibootmgr is not installed'*|*'# '*)
+    *'EFIBOOTMGR=/usr/bin/efibootmgr'*|*'efibootmgr is not installed'*|*'# '*)
       ;;
-    *'efibootmgr --bootnext'*|*'efibootmgr --delete-bootnext'*|*'capture efibootmgr'*)
+    *'--bootnext'*|*'--delete-bootnext'*)
       ;;
     *)
       echo "unexpected efibootmgr invocation: $line" >&2
@@ -88,5 +89,19 @@ while IFS= read -r line; do
       ;;
   esac
 done <"$cli"
+
+# pkexec does not treat -- as the end of its own options. A leading -- is
+# the program name, so elevation must name the binary directly.
+if grep -n -E 'pkexec[[:space:]]+--' "$cli"; then
+  echo "pkexec would try to run a program named --" >&2
+  exit 1
+fi
+
+# Privileged and parsing tools stay on absolute paths. command -v would
+# accept a shadow earlier in the caller's PATH.
+if grep -n -E 'command -v .*(efibootmgr|sudo|pkexec|jq|systemctl|omarchy-system-reboot)' "$cli"; then
+  echo "a privileged tool is resolved through PATH" >&2
+  exit 1
+fi
 
 echo "script.test.sh ok"

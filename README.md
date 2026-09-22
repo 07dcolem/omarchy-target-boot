@@ -86,11 +86,13 @@ when next boot matches the system you picked and the boot order is unchanged.
 Clearing an armed next boot is `efibootmgr --delete-bootnext`, which removes
 that same one-shot variable.
 
-Writing next boot needs root. Passwordless `sudo` is used when the machine
-offers it. Otherwise `pkexec` asks through Omarchy’s polkit prompt, and that
-prompt appears at the end of the countdown. The reboot itself runs as you,
-through `omarchy system reboot`, because the logged-in session is already
-allowed to reboot.
+Writing next boot needs root. The helper drops the caller’s environment and
+runs only the system copy of `efibootmgr`. Passwordless `sudo` is used when
+the machine already allows that program without a password. Otherwise
+`pkexec` asks through Omarchy’s polkit prompt, and that prompt appears at
+the end of the countdown. The reboot itself runs as you, through
+`omarchy system reboot`, because the logged-in session is already allowed
+to reboot.
 
 ## Settings
 

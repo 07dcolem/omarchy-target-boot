@@ -1,17 +1,84 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 # shellcheck shell=bash
 #
 # Read the firmware boot menu and set the one-shot BootNext variable.
 #
 # The write path is two calls and nothing else:
-#   efibootmgr --bootnext XXXX
-#   efibootmgr --delete-bootnext
-# A read is `efibootmgr` with no arguments. Boot order is parsed so it can
-# be compared after a write. It is never passed back to efibootmgr.
+#   /usr/bin/efibootmgr --bootnext XXXX
+#   /usr/bin/efibootmgr --delete-bootnext
+# A read is `/usr/bin/efibootmgr` with no arguments. Boot order is parsed so
+# it can be compared after a write. It is never passed back to efibootmgr.
 
 set -euo pipefail
+IFS=$' \t\n'
 
-VERSION="1.0.0"
+VERSION="1.0.1"
+
+# Privileged programs are absolute paths. PATH is reset to system directories
+# before any other command is looked up, and nothing looked up on PATH is
+# passed to sudo or pkexec.
+EFIBOOTMGR=/usr/bin/efibootmgr
+SUDO=/usr/bin/sudo
+PKEXEC=/usr/bin/pkexec
+JQ=/usr/bin/jq
+SYSTEMCTL=/usr/bin/systemctl
+OMARCHY_REBOOT=/usr/bin/omarchy-system-reboot
+OMARCHY_BIN=/usr/share/omarchy/bin
+
+# Root-owned, not writable by group or other. A symlink is accepted only when
+# its final target stays under /usr or /bin and passes the same checks.
+trusted_path() {
+  local path=$1 want_exec=$2 owner mode target perm
+  [[ $path == /* && -e $path ]] || return 1
+  if [[ -L $path ]]; then
+    target=$(readlink -f -- "$path") || return 1
+    [[ $target == /usr/* || $target == /bin/* || $target == /sbin/* ]] || return 1
+    path=$target
+  fi
+  [[ $want_exec == file && -f $path && -x $path ]] || [[ $want_exec == dir && -d $path ]] || return 1
+  owner=$(stat -c '%u' -- "$path") || return 1
+  mode=$(stat -c '%a' -- "$path") || return 1
+  [[ $owner == 0 && $mode =~ ^[0-7]+$ ]] || return 1
+  perm=$((8#$mode))
+  (( (perm & 0022) == 0 )) || return 1
+}
+
+trusted_executable() { trusted_path "$1" file; }
+trusted_dir() { trusted_path "$1" dir; }
+
+# Drop the caller's environment and come back with only the session values
+# the polkit prompt and the user-session reboot need. A caller-supplied
+# marker is not enough: PATH and the loader variables have to match too.
+sanitize_environment() {
+  local base=/usr/bin:/bin
+  local dirty=0
+  [[ ${TARGET_BOOT_SANITIZED:-} == 1 ]] || dirty=1
+  [[ ${PATH:-} == "$base" ]] || dirty=1
+  [[ -z ${LD_PRELOAD:-}${LD_LIBRARY_PATH:-}${BASH_ENV:-}${ENV:-} ]] || dirty=1
+  if (( dirty )); then
+    exec /usr/bin/env -i \
+      TARGET_BOOT_SANITIZED=1 \
+      PATH="$base" \
+      HOME="${HOME-}" \
+      USER="${USER-}" \
+      LOGNAME="${LOGNAME-${USER-}}" \
+      XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR-}" \
+      DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS-}" \
+      WAYLAND_DISPLAY="${WAYLAND_DISPLAY-}" \
+      DISPLAY="${DISPLAY-}" \
+      XAUTHORITY="${XAUTHORITY-}" \
+      LANG="${LANG-}" \
+      LC_ALL="${LC_ALL-}" \
+      /usr/bin/bash -- "$0" "$@"
+  fi
+  unset LD_PRELOAD LD_LIBRARY_PATH BASH_ENV ENV
+  export PATH="$base"
+  if trusted_dir "$OMARCHY_BIN"; then
+    export PATH="$base:$OMARCHY_BIN"
+  fi
+}
+
+jq() { "$JQ" "$@"; }
 
 fail() {
   jq -cn --arg error "$1" '{ok:false, error:$error}'
@@ -30,7 +97,7 @@ list prints the firmware boot entries as JSON.
 bootnext writes BootNext and leaves every other firmware setting alone.
 clear-next removes BootNext.
 reboot-into writes BootNext, checks that it stuck and that the boot order
-is unchanged, then reboots through omarchy-system-reboot.
+is unchanged, then reboots through /usr/bin/omarchy-system-reboot.
 
 --dry-run prints the argv it would run and does not touch firmware.
 --fixture reads a saved firmware listing. A fixture is refused for a real write.
@@ -59,28 +126,31 @@ capture() {
 }
 
 # Root via passwordless sudo when the machine offers it, otherwise the
-# session polkit agent (pkexec). The helper itself stays the logged-in user
-# so the reboot runs in that user's systemd session.
+# session polkit agent. The elevated program is the pinned efibootmgr, never
+# a path taken from PATH. pkexec treats a leading -- as the program name, so
+# the binary is the first argument. The helper itself stays the logged-in
+# user so the reboot runs in that user's systemd session.
+require_efi() {
+  trusted_executable "$EFIBOOTMGR" || fail "efibootmgr is not installed"
+}
+
 efi_exec() {
+  require_efi
   if [[ $(id -u) -eq 0 ]]; then
-    capture "$@"
+    capture "$EFIBOOTMGR" "$@"
     return
   fi
-  if sudo -n true 2>/dev/null; then
-    capture sudo -n -- "$@"
+  if trusted_executable "$SUDO" && "$SUDO" -n /usr/bin/true >/dev/null 2>&1; then
+    capture "$SUDO" -n -- "$EFIBOOTMGR" "$@"
     return
   fi
-  local bin=$1
-  shift
-  if [[ $bin != /* ]]; then
-    bin=$(command -v -- "$bin") || {
-      CAP_STATUS=127
-      CAP_OUT=""
-      CAP_ERR="efibootmgr was not found"
-      return
-    }
+  if ! trusted_executable "$PKEXEC"; then
+    CAP_STATUS=127
+    CAP_OUT=""
+    CAP_ERR="pkexec was not found"
+    return
   fi
-  capture pkexec -- "$bin" "$@"
+  capture "$PKEXEC" "$EFIBOOTMGR" "$@"
 }
 
 efi_detail() {
@@ -190,11 +260,11 @@ load_firmware() {
     fi
     raw=$(cat -- "$FIXTURE")
   else
-    if ! command -v efibootmgr >/dev/null 2>&1; then
+    if ! trusted_executable "$EFIBOOTMGR"; then
       PARSED=$(jq -cn '{ok:false, error:"efibootmgr is not installed"}')
       return 1
     fi
-    capture efibootmgr
+    capture "$EFIBOOTMGR"
     if [[ ${CAP_STATUS:-1} -ne 0 ]]; then
       local detail
       detail=$(efi_detail)
@@ -242,12 +312,18 @@ refuse_fixture_write() {
 }
 
 auth_failure() {
-  local what=$1
-  if [[ ${CAP_STATUS:-1} -eq 126 || ${CAP_STATUS:-1} -eq 127 ]]; then
+  local what=$1 detail
+  detail=$(efi_detail)
+  if [[ ${CAP_STATUS:-1} -eq 126 ]]; then
     fail "Authorization was declined, so ${what}"
   fi
-  local detail
-  detail=$(efi_detail)
+  if [[ ${CAP_STATUS:-1} -eq 127 ]]; then
+    case $detail in
+      ""|*"Not authorized"*|*"Request dismissed"*|*"Authentication failed"*)
+        fail "Authorization was declined, so ${what}"
+        ;;
+    esac
+  fi
   if [[ -n $detail ]]; then
     fail "Could not ${what}. ${detail}"
   fi
@@ -273,13 +349,13 @@ cmd_bootnext() {
 
   if [[ $dry -eq 1 ]]; then
     local argv
-    argv=$(json_argv efibootmgr --bootnext "$id")
+    argv=$(json_argv "$EFIBOOTMGR" --bootnext "$id")
     jq -cn --arg id "$id" --arg order "$before" --argjson argv "$argv" \
       '{ok:true, dryRun:true, action:"bootnext", id:$id, argv:$argv, bootOrder:($order | split(",") | map(select(length > 0)))}'
     return
   fi
 
-  efi_exec efibootmgr --bootnext "$id"
+  efi_exec --bootnext "$id"
   if [[ ${CAP_STATUS:-1} -ne 0 ]]; then
     auth_failure "set next boot"
   fi
@@ -307,7 +383,7 @@ cmd_clear() {
 
   if [[ $dry -eq 1 ]]; then
     local argv
-    argv=$(json_argv efibootmgr --delete-bootnext)
+    argv=$(json_argv "$EFIBOOTMGR" --delete-bootnext)
     jq -cn --argjson argv "$argv" '{ok:true, dryRun:true, action:"clear-next", argv:$argv}'
     return
   fi
@@ -317,7 +393,7 @@ cmd_clear() {
     return
   fi
 
-  efi_exec efibootmgr --delete-bootnext
+  efi_exec --delete-bootnext
   if [[ ${CAP_STATUS:-1} -ne 0 ]]; then
     auth_failure "clear next boot"
   fi
@@ -336,10 +412,12 @@ cmd_clear() {
 }
 
 reboot_command() {
-  if command -v omarchy-system-reboot >/dev/null 2>&1; then
-    REBOOT_CMD=(omarchy-system-reboot)
+  if trusted_executable "$OMARCHY_REBOOT"; then
+    REBOOT_CMD=("$OMARCHY_REBOOT")
+  elif trusted_executable "$SYSTEMCTL"; then
+    REBOOT_CMD=("$SYSTEMCTL" reboot --no-wall)
   else
-    REBOOT_CMD=(systemctl reboot --no-wall)
+    fail "Could not find a reboot command"
   fi
 }
 
@@ -358,14 +436,14 @@ cmd_reboot_into() {
 
   if [[ $dry -eq 1 ]]; then
     local argv reboot
-    argv=$(json_argv efibootmgr --bootnext "$id")
+    argv=$(json_argv "$EFIBOOTMGR" --bootnext "$id")
     reboot=$(json_argv "${REBOOT_CMD[@]}")
     jq -cn --arg id "$id" --argjson argv "$argv" --argjson reboot "$reboot" \
       '{ok:true, dryRun:true, action:"reboot-into", id:$id, argv:$argv, reboot:$reboot}'
     return
   fi
 
-  efi_exec efibootmgr --bootnext "$id"
+  efi_exec --bootnext "$id"
   if [[ ${CAP_STATUS:-1} -ne 0 ]]; then
     auth_failure "set next boot"
   fi
@@ -393,7 +471,9 @@ cmd_reboot_into() {
   jq -cn --arg id "$id" '{ok:true, action:"reboot-into", id:$id, bootNext:$id}'
 }
 
-if ! command -v jq >/dev/null 2>&1; then
+sanitize_environment "$@"
+
+if ! trusted_executable "$JQ"; then
   printf '%s\n' '{"ok":false,"error":"jq is not installed"}'
   exit 1
 fi
