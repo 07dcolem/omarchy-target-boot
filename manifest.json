@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.07dcolem.target-boot",
+  "name": "Reboot into",
+  "version": "1.0.0",
+  "author": "Dylan Coleman",
+  "license": "MIT",
+  "homepage": "https://github.com/07dcolem/omarchy-target-boot",
+  "description": "Bar icon that counts down and reboots into another EFI operating system for the next boot only.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Reboot into",
+    "description": "Restart glyph in the bar. The menu lists firmware operating systems and reboots into the one you pick, for the next boot only.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showInactive": false
+    },
+    "schema": [
+      {
+        "key": "showInactive",
+        "type": "boolean",
+        "label": "Show inactive entries",
+        "defaultValue": false,
+        "description": "Include firmware entries the setup has marked inactive. They stay out of the menu otherwise."
+      }
+    ]
+  }
+}

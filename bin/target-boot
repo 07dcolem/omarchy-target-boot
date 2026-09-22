@@ -1,0 +1,464 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+#
+# Read the firmware boot menu and set the one-shot BootNext variable.
+#
+# The write path is two calls and nothing else:
+#   efibootmgr --bootnext XXXX
+#   efibootmgr --delete-bootnext
+# A read is `efibootmgr` with no arguments. Boot order is parsed so it can
+# be compared after a write. It is never passed back to efibootmgr.
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+fail() {
+  jq -cn --arg error "$1" '{ok:false, error:$error}'
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  target-boot list [--fixture FILE]
+  target-boot bootnext HEXID [--dry-run] [--fixture FILE]
+  target-boot clear-next [--dry-run] [--fixture FILE]
+  target-boot reboot-into HEXID [--dry-run] [--fixture FILE]
+
+list prints the firmware boot entries as JSON.
+bootnext writes BootNext and leaves every other firmware setting alone.
+clear-next removes BootNext.
+reboot-into writes BootNext, checks that it stuck and that the boot order
+is unchanged, then reboots through omarchy-system-reboot.
+
+--dry-run prints the argv it would run and does not touch firmware.
+--fixture reads a saved firmware listing. A fixture is refused for a real write.
+EOF
+}
+
+json_argv() {
+  if (($# == 0)); then
+    printf '[]\n'
+    return
+  fi
+  printf '%s\n' "$@" | jq -R . | jq -cs .
+}
+
+capture() {
+  local out err
+  out=$(mktemp)
+  err=$(mktemp)
+  set +e
+  "$@" >"$out" 2>"$err"
+  CAP_STATUS=$?
+  set -e
+  CAP_OUT=$(cat -- "$out")
+  CAP_ERR=$(cat -- "$err")
+  rm -f -- "$out" "$err"
+}
+
+# Root via passwordless sudo when the machine offers it, otherwise the
+# session polkit agent (pkexec). The helper itself stays the logged-in user
+# so the reboot runs in that user's systemd session.
+efi_exec() {
+  if [[ $(id -u) -eq 0 ]]; then
+    capture "$@"
+    return
+  fi
+  if sudo -n true 2>/dev/null; then
+    capture sudo -n -- "$@"
+    return
+  fi
+  local bin=$1
+  shift
+  if [[ $bin != /* ]]; then
+    bin=$(command -v -- "$bin") || {
+      CAP_STATUS=127
+      CAP_OUT=""
+      CAP_ERR="efibootmgr was not found"
+      return
+    }
+  fi
+  capture pkexec -- "$bin" "$@"
+}
+
+efi_detail() {
+  local detail=${CAP_ERR:-${CAP_OUT:-}}
+  detail=${detail//$'\n'/ }
+  detail=${detail#"${detail%%[![:space:]]*}"}
+  detail=${detail%"${detail##*[![:space:]]}"}
+  printf '%s\n' "$detail"
+}
+
+efi_file() {
+  local path=$1
+  local lower=${path,,}
+  local key="\\efi\\"
+  local head=${lower%%"$key"*}
+  if [[ $head == "$lower" ]]; then
+    key="/efi/"
+    head=${lower%%"$key"*}
+    if [[ $head == "$lower" ]]; then
+      printf '\n'
+      return
+    fi
+  fi
+  local slice=${path:${#head}}
+  if [[ $slice =~ ^([^[:space:]]*\.[Ee][Ff][Ii]) ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return
+  fi
+  printf '\n'
+}
+
+trim() {
+  local value=$1
+  value=${value#"${value%%[![:space:]]*}"}
+  value=${value%"${value##*[![:space:]]}"}
+  printf '%s\n' "$value"
+}
+
+parse_listing() {
+  local raw=$1
+  local boot_current="" boot_next="" order_csv=""
+  local entries='[]'
+  local line id mark rest label path file active
+
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    if [[ $line =~ ^BootCurrent:[[:space:]]*([0-9A-Fa-f]{4})[[:space:]]*$ ]]; then
+      boot_current=${BASH_REMATCH[1]^^}
+    elif [[ $line =~ ^BootNext:[[:space:]]*([0-9A-Fa-f]{4})[[:space:]]*$ ]]; then
+      boot_next=${BASH_REMATCH[1]^^}
+    elif [[ $line =~ ^BootOrder:[[:space:]]*([0-9A-Fa-f,[:space:]]+)[[:space:]]*$ ]]; then
+      order_csv=${BASH_REMATCH[1]//[[:space:]]/}
+      order_csv=${order_csv^^}
+    elif [[ $line =~ ^Boot([0-9A-Fa-f]{4})([*[:space:]])[[:space:]](.*)$ ]]; then
+      id=${BASH_REMATCH[1]^^}
+      mark=${BASH_REMATCH[2]}
+      rest=${BASH_REMATCH[3]}
+      active=false
+      [[ $mark == "*" ]] && active=true
+      label=$rest
+      path=""
+      if [[ $rest == *$'\t'* ]]; then
+        label=${rest%%$'\t'*}
+        path=${rest#*$'\t'}
+      fi
+      label=$(trim "$label")
+      file=$(efi_file "$path")
+      entries=$(jq -c \
+        --arg id "$id" \
+        --argjson active "$active" \
+        --arg label "$label" \
+        --arg path "$path" \
+        --arg file "$file" \
+        '. + [{id:$id, active:$active, label:$label, path:$path, file:$file}]' <<<"$entries")
+    fi
+  done <<<"$raw"
+
+  jq -c \
+    --arg current "$boot_current" \
+    --arg next "$boot_next" \
+    --arg order "$order_csv" \
+    '
+      ($order | split(",") | map(select(length > 0))) as $ids
+      | . as $all
+      | [ $ids[] as $id | $all[] | select(.id == $id) ] as $ordered
+      | [ $all[] | select(.id as $id | ($ids | index($id)) == null) ] as $rest
+      | ($ordered + $rest) as $rows
+      | {
+          ok: true,
+          bootCurrent: (if $current == "" then null else $current end),
+          bootNext: (if $next == "" then null else $next end),
+          bootOrder: $ids,
+          entries: ($rows | map(. + {
+            current: (.id == $current),
+            next: ($next != "" and .id == $next)
+          }))
+        }
+    ' <<<"$entries"
+}
+
+load_firmware() {
+  local raw
+  if [[ -n ${FIXTURE:-} ]]; then
+    if [[ ! -f $FIXTURE ]]; then
+      PARSED=$(jq -cn '{ok:false, error:"Fixture could not be read"}')
+      return 1
+    fi
+    raw=$(cat -- "$FIXTURE")
+  else
+    if ! command -v efibootmgr >/dev/null 2>&1; then
+      PARSED=$(jq -cn '{ok:false, error:"efibootmgr is not installed"}')
+      return 1
+    fi
+    capture efibootmgr
+    if [[ ${CAP_STATUS:-1} -ne 0 ]]; then
+      local detail
+      detail=$(efi_detail)
+      PARSED=$(jq -cn --arg error "Could not read the EFI boot entries. ${detail}" '{ok:false, error:$error}')
+      return 1
+    fi
+    raw=$CAP_OUT
+  fi
+
+  if ! PARSED=$(parse_listing "$raw"); then
+    PARSED=$(jq -cn '{ok:false, error:"Could not read the EFI boot entries"}')
+    return 1
+  fi
+  if ! jq -e '.bootCurrent != null or (.entries | length) > 0' <<<"$PARSED" >/dev/null; then
+    PARSED=$(jq -cn '{ok:false, error:"Could not read the EFI boot entries"}')
+    return 1
+  fi
+}
+
+normalize_id() {
+  local id=${1^^}
+  [[ $id =~ ^[0-9A-F]{4}$ ]] || return 1
+  printf '%s\n' "$id"
+}
+
+require_known() {
+  local id=$1
+  if ! jq -e --arg id "$id" 'any(.entries[]; .id == $id)' <<<"$PARSED" >/dev/null; then
+    fail "That operating system is not in the firmware list"
+  fi
+}
+
+order_csv() {
+  jq -r '.bootOrder | join(",")' <<<"$PARSED"
+}
+
+boot_next_value() {
+  jq -r '.bootNext // empty' <<<"$PARSED"
+}
+
+refuse_fixture_write() {
+  if [[ -n ${FIXTURE:-} && ${1:-0} -eq 0 ]]; then
+    fail "A fixture cannot be used when writing firmware"
+  fi
+}
+
+auth_failure() {
+  local what=$1
+  if [[ ${CAP_STATUS:-1} -eq 126 || ${CAP_STATUS:-1} -eq 127 ]]; then
+    fail "Authorization was declined, so ${what}"
+  fi
+  local detail
+  detail=$(efi_detail)
+  if [[ -n $detail ]]; then
+    fail "Could not ${what}. ${detail}"
+  fi
+  fail "Could not ${what}"
+}
+
+cmd_list() {
+  load_firmware || { printf '%s\n' "$PARSED"; exit 1; }
+  printf '%s\n' "$PARSED"
+}
+
+cmd_bootnext() {
+  local id dry=$1
+  shift
+  if ! id=$(normalize_id "${1:-}"); then
+    fail "Boot id must be four hex digits"
+  fi
+  refuse_fixture_write "$dry"
+  load_firmware || { printf '%s\n' "$PARSED"; exit 1; }
+  require_known "$id"
+  local before
+  before=$(order_csv)
+
+  if [[ $dry -eq 1 ]]; then
+    local argv
+    argv=$(json_argv efibootmgr --bootnext "$id")
+    jq -cn --arg id "$id" --arg order "$before" --argjson argv "$argv" \
+      '{ok:true, dryRun:true, action:"bootnext", id:$id, argv:$argv, bootOrder:($order | split(",") | map(select(length > 0)))}'
+    return
+  fi
+
+  efi_exec efibootmgr --bootnext "$id"
+  if [[ ${CAP_STATUS:-1} -ne 0 ]]; then
+    auth_failure "set next boot"
+  fi
+
+  load_firmware || { printf '%s\n' "$PARSED"; exit 1; }
+  local after next
+  after=$(order_csv)
+  next=$(boot_next_value)
+  if [[ $before != "$after" ]]; then
+    fail "The firmware boot order changed, so nothing further was run"
+  fi
+  if [[ $next != "$id" ]]; then
+    fail "Next boot did not stick. The reboot was not started"
+  fi
+  jq -cn --arg id "$id" '{ok:true, action:"bootnext", id:$id, bootNext:$id}'
+}
+
+cmd_clear() {
+  local dry=$1
+  refuse_fixture_write "$dry"
+  load_firmware || { printf '%s\n' "$PARSED"; exit 1; }
+  local before next
+  before=$(order_csv)
+  next=$(boot_next_value)
+
+  if [[ $dry -eq 1 ]]; then
+    local argv
+    argv=$(json_argv efibootmgr --delete-bootnext)
+    jq -cn --argjson argv "$argv" '{ok:true, dryRun:true, action:"clear-next", argv:$argv}'
+    return
+  fi
+
+  if [[ -z $next ]]; then
+    jq -cn '{ok:true, action:"clear-next", bootNext:null}'
+    return
+  fi
+
+  efi_exec efibootmgr --delete-bootnext
+  if [[ ${CAP_STATUS:-1} -ne 0 ]]; then
+    auth_failure "clear next boot"
+  fi
+
+  load_firmware || { printf '%s\n' "$PARSED"; exit 1; }
+  local after
+  after=$(order_csv)
+  next=$(boot_next_value)
+  if [[ $before != "$after" ]]; then
+    fail "The firmware boot order changed, so nothing further was run"
+  fi
+  if [[ -n $next ]]; then
+    fail "Next boot is still set"
+  fi
+  jq -cn '{ok:true, action:"clear-next", bootNext:null}'
+}
+
+reboot_command() {
+  if command -v omarchy-system-reboot >/dev/null 2>&1; then
+    REBOOT_CMD=(omarchy-system-reboot)
+  else
+    REBOOT_CMD=(systemctl reboot --no-wall)
+  fi
+}
+
+cmd_reboot_into() {
+  local id dry=$1
+  shift
+  if ! id=$(normalize_id "${1:-}"); then
+    fail "Boot id must be four hex digits"
+  fi
+  refuse_fixture_write "$dry"
+  load_firmware || { printf '%s\n' "$PARSED"; exit 1; }
+  require_known "$id"
+  local before
+  before=$(order_csv)
+  reboot_command
+
+  if [[ $dry -eq 1 ]]; then
+    local argv reboot
+    argv=$(json_argv efibootmgr --bootnext "$id")
+    reboot=$(json_argv "${REBOOT_CMD[@]}")
+    jq -cn --arg id "$id" --argjson argv "$argv" --argjson reboot "$reboot" \
+      '{ok:true, dryRun:true, action:"reboot-into", id:$id, argv:$argv, reboot:$reboot}'
+    return
+  fi
+
+  efi_exec efibootmgr --bootnext "$id"
+  if [[ ${CAP_STATUS:-1} -ne 0 ]]; then
+    auth_failure "set next boot"
+  fi
+
+  load_firmware || { printf '%s\n' "$PARSED"; exit 1; }
+  local after next
+  after=$(order_csv)
+  next=$(boot_next_value)
+  if [[ $before != "$after" ]]; then
+    fail "The firmware boot order changed, so the reboot was not started"
+  fi
+  if [[ $next != "$id" ]]; then
+    fail "Next boot did not stick, so the reboot was not started"
+  fi
+
+  capture "${REBOOT_CMD[@]}"
+  if [[ ${CAP_STATUS:-1} -ne 0 ]]; then
+    local detail
+    detail=$(efi_detail)
+    if [[ -n $detail ]]; then
+      fail "Next boot is set to ${id}, and the reboot did not start. ${detail}"
+    fi
+    fail "Next boot is set to ${id}, and the reboot did not start"
+  fi
+  jq -cn --arg id "$id" '{ok:true, action:"reboot-into", id:$id, bootNext:$id}'
+}
+
+if ! command -v jq >/dev/null 2>&1; then
+  printf '%s\n' '{"ok":false,"error":"jq is not installed"}'
+  exit 1
+fi
+
+FIXTURE=""
+DRY=0
+POSITIONAL=()
+
+while (($# > 0)); do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --version)
+      printf '%s\n' "$VERSION"
+      exit 0
+      ;;
+    --fixture)
+      [[ -n ${2:-} ]] || fail "Pass a file after --fixture"
+      FIXTURE=$2
+      shift 2
+      ;;
+    --dry-run)
+      DRY=1
+      shift
+      ;;
+    --)
+      shift
+      POSITIONAL+=("$@")
+      break
+      ;;
+    -*)
+      fail "Unknown option: $1"
+      ;;
+    *)
+      POSITIONAL+=("$1")
+      shift
+      ;;
+  esac
+done
+
+cmd=${POSITIONAL[0]:-}
+case "$cmd" in
+  list)
+    [[ ${#POSITIONAL[@]} -eq 1 ]] || fail "list takes no arguments"
+    cmd_list
+    ;;
+  bootnext)
+    [[ ${#POSITIONAL[@]} -eq 2 ]] || fail "bootnext takes the four digit boot id"
+    cmd_bootnext "$DRY" "${POSITIONAL[1]}"
+    ;;
+  clear-next)
+    [[ ${#POSITIONAL[@]} -eq 1 ]] || fail "clear-next takes no arguments"
+    cmd_clear "$DRY"
+    ;;
+  reboot-into)
+    [[ ${#POSITIONAL[@]} -eq 2 ]] || fail "reboot-into takes the four digit boot id"
+    cmd_reboot_into "$DRY" "${POSITIONAL[1]}"
+    ;;
+  "")
+    usage >&2
+    fail "Choose list, bootnext, clear-next, or reboot-into"
+    ;;
+  *)
+    fail "Unknown command: $cmd"
+    ;;
+esac
