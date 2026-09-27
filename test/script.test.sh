@@ -7,6 +7,7 @@ cli=$root/bin/target-boot
 fix=$root/test/fixtures/sample.txt
 
 [[ -x $cli ]] || chmod +x "$cli"
+[[ $("$cli" --version) == "$(jq -r .version "$root/manifest.json")" ]]
 
 mkdir -p -- "$root/test/fixtures"
 # Real tabs, matching efibootmgr. The Windows line carries the optional-data
