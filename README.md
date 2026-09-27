@@ -39,18 +39,26 @@ omarchy plugin remove io.github.07dcolem.target-boot
 |---|---|
 | Bar icon | left click opens the menu, right click reads the firmware again |
 | Operating system row | starts the countdown for that system |
+| ⋮ on a row | Rename or Hide |
+| Hidden | lists the systems you hid, and shows one again |
 | Stay here | cancels the countdown |
 | Clear next boot | drops a next boot that is already armed |
+
+The ⋮ menu sits at the end of each row. **Rename** edits the name shown in this plugin. **Hide** takes that system off the list. **Hidden** at the bottom of the menu lists every hidden system, including one the firmware no longer has, and **Unhide** puts it back. Rename and hide are saved on the widget. The firmware menu stays as it is. An inactive system shows in the main list again when **Show inactive entries** is on.
 
 Keyboard, while the menu is open:
 
 | Key | Action |
 |---|---|
 | `j` `k` ↑ ↓ | move |
+| `h` `l` ← → | leave the ⋮ button, or move onto it |
 | `Enter` `Space` | start the countdown for the highlighted system |
-| `Esc` | cancel the countdown, or close the menu |
+| `.` | open Rename and Hide for the highlighted system |
+| `Esc` | close that menu, leave Hidden, cancel the countdown, or close the menu |
 | `r` | read the firmware again |
 | `Tab` | move to the next bar panel |
+
+In the ⋮ menu, `j` and `k` move between Rename and Hide, and Enter runs the highlighted one. In Hidden, Enter shows the highlighted system again. A renamed name is what the countdown and the bar tooltip use. Clearing the field puts the firmware name back.
 
 The current system is marked **This boot**. A system already chosen for the
 following boot is marked **Next boot**.
@@ -86,6 +94,8 @@ when next boot matches the system you picked and the boot order is unchanged.
 Clearing an armed next boot is `efibootmgr --delete-bootnext`, which removes
 that same one-shot variable.
 
+Rename and hide are saved on the widget entry in `shell.json`.
+
 Writing next boot needs root. The helper drops the caller’s environment and
 runs only the system copy of `efibootmgr`. Passwordless `sudo` is used when
 the machine already allows that program without a password. Otherwise
@@ -102,6 +112,18 @@ Setup → Plugins.
 | Key | Default | What it does |
 |---|---|---|
 | `showInactive` | `false` | Also list firmware entries marked inactive |
+| `names` | none | Boot id to the name shown in the menu. Written by Rename |
+| `hidden` | none | Boot ids left out of the main list. Written by Hide |
+
+`names` and `hidden` are edited from the menu. A boot id is four hex digits, the same id `list` prints. A name is at most 80 characters, and at most 64 names and 64 hidden ids are kept. Example:
+
+```json
+{
+  "id": "io.github.07dcolem.target-boot",
+  "names": { "0001": "Windows" },
+  "hidden": ["0007"]
+}
+```
 
 ## Scripting
 
@@ -133,8 +155,8 @@ the hold.
 ## How it works
 
 `Panel.qml` is the bar widget and the popup. `Model.js` is the countdown copy,
-the row text, and the JSON parsing, with no processes in it. `bin/target-boot`
-is the only thing that runs `efibootmgr`.
+the row text, the name map, the hidden list, and the JSON parsing, with no
+processes in it. `bin/target-boot` is the only thing that runs `efibootmgr`.
 
 Device paths and labels are firmware data. Every line of text in the panel is
 plain text, and labels are passed to `jq` as arguments, so a name cannot
@@ -148,6 +170,18 @@ node test/model.test.js
 bash test/script.test.sh
 omarchy plugin validate .
 ```
+
+## Changelog
+
+### 1.1.0
+
+- Each operating system row has a ⋮ menu with Rename and Hide.
+- Rename stores a display name on the widget as `names` in `shell.json`. The firmware name is unchanged, and clearing the field restores it. The list, the countdown, and the bar tooltip use the display name.
+- Hide stores boot ids as `hidden` on that same entry. Hidden lists them, including an id the firmware no longer has, and Unhide puts one back in the main list.
+
+### 1.0.1
+
+- Reboot still runs when passwordless `sudo` is unavailable. Elevation is `pkexec /usr/bin/efibootmgr`, without a leading `--`.
 
 ## License
 

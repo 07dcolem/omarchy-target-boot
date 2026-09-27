@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.07dcolem.target-boot",
   "name": "Reboot into",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "author": "Dylan Coleman",
   "license": "MIT",
   "homepage": "https://github.com/07dcolem/omarchy-target-boot",
@@ -13,7 +13,7 @@
   },
   "barWidget": {
     "displayName": "Reboot into",
-    "description": "Restart glyph in the bar. The menu lists firmware operating systems and reboots into the one you pick, for the next boot only.",
+    "description": "Restart glyph in the bar. The menu lists firmware operating systems and reboots into the one you pick, for the next boot only. Each entry can be renamed or hidden.",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right",

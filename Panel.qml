@@ -26,6 +26,8 @@ Panel {
   readonly property color dim: Qt.darker(foreground, 1.45)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property bool showInactive: setting("showInactive", false) === true
+  readonly property var nameMap: Model.sanitizeNames(setting("names", null))
+  readonly property var hiddenIds: Model.sanitizeHidden(setting("hidden", null))
   readonly property color hoverFill: Style.hoverFillFor(foreground, Color.accent)
   readonly property color selectedFill: Style.selectedFillFor(foreground, Color.accent)
 
@@ -35,6 +37,13 @@ Panel {
   property bool cursorActive: false
   property int selectedIndex: 0
   property bool cursorReady: false
+  property bool actionFocused: false
+  property bool showingHidden: false
+  property string menuEntryId: ""
+  property int menuAction: 0
+  property string renamingId: ""
+  property bool renameFieldActive: false
+  property bool suppressActivate: false
 
   property bool departing: false
   property bool busy: false
@@ -45,17 +54,28 @@ Panel {
   property int pendingCountdown: Model.countdownStart()
   property string shownLine: ""
 
-  readonly property var visibleEntries: Model.visibleEntries(firmware, showInactive)
+  readonly property var visibleEntries: Model.visibleEntries(firmware, showInactive, hiddenIds)
+  readonly property var hiddenEntries: Model.hiddenEntries(firmware, hiddenIds)
+  readonly property var listedEntries: showingHidden ? hiddenEntries : visibleEntries
   readonly property string bootNextId: firmware && firmware.bootNext ? String(firmware.bootNext) : ""
   readonly property string bootNextLabel: {
     var entry = Model.entryById(firmware ? firmware.entries : [], bootNextId)
-    return entry && entry.label ? String(entry.label) : ""
+    return entry ? Model.displayLabel(entry, nameMap) : ""
   }
   readonly property string statusLine: Model.departingLine(countdown, departingLabel)
   readonly property string caption: {
+    if (showingHidden)
+      return "These stay out of the list until you show them again."
     if (bootNextLabel !== "")
       return "Next boot is " + bootNextLabel + ". Pick another operating system to replace it."
     return "Pick an operating system. It counts down, sets next boot, and reboots."
+  }
+  readonly property string emptyText: {
+    if (!(firmware && firmware.ok)) return "Reading firmware…"
+    if (showingHidden) return "No hidden operating systems"
+    if (hiddenIds && hiddenIds.length > 0 && visibleEntries && visibleEntries.length === 0)
+      return "Every operating system is hidden"
+    return "No EFI operating systems"
   }
 
   readonly property int barSlot: Style.bar.iconSlot
@@ -68,28 +88,87 @@ Panel {
     listProc.running = true
   }
 
-  function syncCursor() {
-    var rows = visibleEntries
-    if (!cursorReady) {
-      var current = Model.indexOfCurrent(rows)
-      selectedIndex = current >= 0 ? current : 0
-      cursorReady = true
-      return
-    }
-    if (selectedIndex >= rows.length) selectedIndex = Math.max(0, rows.length - 1)
+  function cursorCount() {
+    var hiddenCount = hiddenIds && hiddenIds.length > 0 ? hiddenIds.length : 0
+    var rowCount = listedEntries && listedEntries.length > 0 ? listedEntries.length : 0
+    var extra = !showingHidden && hiddenCount > 0 ? 1 : 0
+    return rowCount + extra
   }
 
-  function moveCursor(delta) {
-    if (departing) return
+  function onHiddenButton() {
+    var hiddenCount = hiddenIds && hiddenIds.length > 0 ? hiddenIds.length : 0
+    var rowCount = visibleEntries && visibleEntries.length > 0 ? visibleEntries.length : 0
+    return !showingHidden && hiddenCount > 0 && selectedIndex === rowCount
+  }
+
+  function syncCursor() {
+    var count = cursorCount()
+    if (!cursorReady) {
+      if (showingHidden) selectedIndex = 0
+      else {
+        var current = Model.indexOfCurrent(visibleEntries)
+        selectedIndex = current >= 0 ? current : 0
+      }
+      cursorReady = true
+    } else if (count === 0) {
+      selectedIndex = 0
+    } else if (selectedIndex >= count) {
+      selectedIndex = count - 1
+    }
+    if (menuEntryId !== "") {
+      var rows = listedEntries
+      var still = false
+      for (var i = 0; i < rows.length; i++) {
+        if (rows[i] && Model.normalizeId(rows[i].id) === menuEntryId) still = true
+      }
+      if (!still) menuEntryId = ""
+    }
+  }
+
+  function moveCursor(dx, dy) {
+    if (departing || renamingId !== "") return
     cursorActive = true
-    selectedIndex = Model.moveIndex(selectedIndex, delta, visibleEntries.length)
+    if (menuEntryId !== "") {
+      if (dy > 0) menuAction = 1
+      else if (dy < 0) menuAction = 0
+      else if (dx < 0) {
+        menuEntryId = ""
+        actionFocused = true
+      }
+      return
+    }
+    if (dx > 0) {
+      if (!onHiddenButton()) actionFocused = true
+      return
+    }
+    if (dx < 0) {
+      actionFocused = false
+      return
+    }
+    if (dy === 0) return
+    actionFocused = false
+    menuEntryId = ""
+    selectedIndex = Model.moveIndex(selectedIndex, dy, cursorCount())
   }
 
   function activateCursor() {
-    if (departing || busy || committed) return
-    var rows = visibleEntries
+    if (departing || busy || committed || renamingId !== "" || suppressActivate) return
+    if (menuEntryId !== "") {
+      runMenuAction()
+      return
+    }
+    if (onHiddenButton()) {
+      openHidden()
+      return
+    }
+    var rows = listedEntries
     if (selectedIndex < 0 || selectedIndex >= rows.length) return
-    beginDeparture(rows[selectedIndex].id)
+    if (actionFocused) {
+      toggleRowMenu(rows[selectedIndex].id)
+      return
+    }
+    if (showingHidden) unhideEntry(rows[selectedIndex].id)
+    else beginDeparture(rows[selectedIndex].id)
   }
 
   function playArrive() {
@@ -116,7 +195,7 @@ Panel {
     errorText = ""
     var already = departing
     departingId = clean
-    departingLabel = String(entry.label || clean)
+    departingLabel = Model.displayLabel(entry, nameMap)
     countdown = Model.countdownStart()
     pendingCountdown = countdown
     shownLine = ""
@@ -180,6 +259,127 @@ Panel {
     clearProc.running = true
   }
 
+  // The shell replaces the whole widget entry on write, so keys other than
+  // the name map and the hidden list have to be copied across.
+  function persistPreferences(names, hidden) {
+    var entry = { id: moduleName }
+    var current = settings || {}
+    for (var key in current) {
+      if (key === "id" || key === "names" || key === "hidden") continue
+      entry[key] = current[key]
+    }
+    var cleanNames = Model.sanitizeNames(names)
+    var cleanHidden = Model.sanitizeHidden(hidden)
+    var named = false
+    for (var nameKey in cleanNames) {
+      named = true
+      break
+    }
+    if (named) entry.names = cleanNames
+    if (cleanHidden.length > 0) entry.hidden = cleanHidden
+    settings = entry
+    var shell = bar && bar.shell
+    if (shell && typeof shell.updateEntryInline === "function")
+      shell.updateEntryInline(moduleName, entry)
+  }
+
+  function openHidden() {
+    if (departing || busy || committed) return
+    showingHidden = true
+    menuEntryId = ""
+    menuAction = 0
+    actionFocused = false
+    renamingId = ""
+    cursorActive = true
+    cursorReady = false
+    syncCursor()
+  }
+
+  function closeHidden() {
+    showingHidden = false
+    menuEntryId = ""
+    menuAction = 0
+    actionFocused = false
+    cursorReady = false
+    syncCursor()
+  }
+
+  function toggleRowMenu(id) {
+    var clean = Model.normalizeId(id)
+    if (!clean || departing || renamingId !== "") return
+    if (menuEntryId === clean) {
+      menuEntryId = ""
+      return
+    }
+    var rows = listedEntries
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i] && Model.normalizeId(rows[i].id) === clean) selectedIndex = i
+    }
+    menuEntryId = clean
+    menuAction = 0
+    actionFocused = true
+    cursorActive = true
+  }
+
+  function runMenuAction() {
+    var id = menuEntryId
+    if (!id) return
+    if (menuAction === 0) startRename(id)
+    else if (showingHidden) unhideEntry(id)
+    else hideEntry(id)
+  }
+
+  function startRename(id) {
+    var clean = Model.normalizeId(id)
+    if (!clean || departing || busy || committed) return
+    menuEntryId = ""
+    actionFocused = false
+    renamingId = clean
+  }
+
+  function cancelRename() {
+    renamingId = ""
+    renameFieldActive = false
+    Qt.callLater(function() { if (keyCatcher) keyCatcher.forceActiveFocus() })
+  }
+
+  function commitRename(id, text) {
+    var clean = Model.normalizeId(id)
+    if (!clean || renamingId !== clean) return
+    renamingId = ""
+    renameFieldActive = false
+    suppressActivate = true
+    var entry = Model.entryById(firmware ? firmware.entries : [], clean)
+    var stored = Model.storedName(entry ? entry.label : "", text)
+    var nextNames = Model.withName(nameMap, clean, stored)
+    var keptHidden = hiddenIds
+    Qt.callLater(function() {
+      persistPreferences(nextNames, keptHidden)
+      suppressActivate = false
+      if (keyCatcher) keyCatcher.forceActiveFocus()
+    })
+  }
+
+  function hideEntry(id) {
+    var clean = Model.normalizeId(id)
+    if (!clean || departing || busy || committed) return
+    menuEntryId = ""
+    actionFocused = false
+    var nextHidden = Model.withHidden(hiddenIds, clean, true)
+    var keptNames = nameMap
+    Qt.callLater(function() { persistPreferences(keptNames, nextHidden) })
+  }
+
+  function unhideEntry(id) {
+    var clean = Model.normalizeId(id)
+    if (!clean || departing || busy || committed) return
+    menuEntryId = ""
+    actionFocused = false
+    var nextHidden = Model.withHidden(hiddenIds, clean, false)
+    var keptNames = nameMap
+    Qt.callLater(function() { persistPreferences(keptNames, nextHidden) })
+  }
+
   function applyList(code, stdout) {
     var parsed = Model.parsePayload(stdout)
     if (code !== 0 || !parsed.ok || !Array.isArray(parsed.bootOrder)) {
@@ -194,12 +394,21 @@ Panel {
 
   onStatusLineChanged: if (departing) shownLine = ""
   onDepartingChanged: if (departing) playArrive()
-  onSettingsChanged: syncCursor()
+  // Settings can change while the item is still being created. Defer the
+  // cursor update so the name map and hidden list exist first.
+  onSettingsChanged: Qt.callLater(syncCursor)
   onOpenedChanged: {
     if (opened) {
       refresh()
       return
     }
+    renamingId = ""
+    renameFieldActive = false
+    suppressActivate = false
+    menuEntryId = ""
+    menuAction = 0
+    actionFocused = false
+    showingHidden = false
     if (!committed) cancelDeparture()
   }
   Component.onCompleted: refresh()
@@ -318,18 +527,26 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      blocked: root.renameFieldActive
 
-      onMoveRequested: function(dx, dy) {
-        if (dy !== 0) root.moveCursor(dy)
-      }
+      onMoveRequested: function(dx, dy) { root.moveCursor(dx, dy) }
       onActivateRequested: root.activateCursor()
       onCloseRequested: {
-        if (root.departing && !root.busy && !root.committed) root.cancelDeparture()
+        if (root.renamingId !== "") root.cancelRename()
+        else if (root.menuEntryId !== "") root.menuEntryId = ""
+        else if (root.showingHidden) root.closeHidden()
+        else if (root.departing && !root.busy && !root.committed) root.cancelDeparture()
         else root.close()
       }
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(text) {
-        if (text === "r" && !root.departing) root.refresh()
+        if (root.renamingId !== "" || root.departing) return
+        if (text === "r") root.refresh()
+        else if (text === "." && !root.onHiddenButton()) {
+          var rows = root.listedEntries
+          if (root.selectedIndex >= 0 && root.selectedIndex < rows.length)
+            root.toggleRowMenu(rows[root.selectedIndex].id)
+        }
       }
 
       Flickable {
@@ -399,16 +616,28 @@ Panel {
 
               Behavior on opacity { NumberAnimation { duration: 180; easing.type: Easing.OutQuad } }
 
+              Button {
+                width: parent.width
+                visible: root.showingHidden
+                text: "Operating systems"
+                tooltipText: "Or press Esc"
+                leftAlign: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.body
+                onClicked: root.closeHidden()
+              }
+
               PanelSectionHeader {
-                text: "OPERATING SYSTEMS"
+                text: root.showingHidden ? "HIDDEN" : "OPERATING SYSTEMS"
                 foreground: root.foreground
                 fontFamily: root.fontFamily
               }
 
               Text {
                 width: parent.width
-                visible: root.visibleEntries.length === 0
-                text: root.firmware && root.firmware.ok ? "No EFI operating systems" : "Reading firmware…"
+                visible: !root.listedEntries || root.listedEntries.length === 0
+                text: root.emptyText
                 textFormat: Text.PlainText
                 wrapMode: Text.WordWrap
                 color: root.dim
@@ -417,7 +646,7 @@ Panel {
               }
 
               Repeater {
-                model: root.visibleEntries
+                model: root.listedEntries
 
                 OsRow {
                   required property var modelData
@@ -425,6 +654,26 @@ Panel {
                   width: listBlock.width
                   entry: modelData
                   rowIndex: index
+                }
+              }
+
+              Button {
+                width: parent.width
+                visible: !root.showingHidden && root.hiddenIds && root.hiddenIds.length > 0
+                text: "Hidden (" + (root.hiddenIds ? root.hiddenIds.length : 0) + ")"
+                tooltipText: "Operating systems you hid"
+                leftAlign: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.body
+                hasCursor: root.cursorActive && root.onHiddenButton()
+                onClicked: root.openHidden()
+                onHovered: function(isHovered) {
+                  if (!isHovered || root.departing) return
+                  root.cursorActive = true
+                  root.selectedIndex = root.visibleEntries ? root.visibleEntries.length : 0
+                  root.actionFocused = false
+                  root.menuEntryId = ""
                 }
               }
             }
@@ -532,7 +781,7 @@ Panel {
 
           Button {
             width: parent.width
-            visible: root.bootNextId !== "" && !root.departing && !root.busy
+            visible: root.bootNextId !== "" && !root.departing && !root.busy && !root.showingHidden
             text: "Clear next boot"
             bordered: true
             foreground: root.foreground
@@ -551,7 +800,12 @@ Panel {
     property var entry: null
     property int rowIndex: 0
 
+    readonly property string entryId: Model.normalizeId(entry && entry.id)
+    readonly property string shownLabel: Model.displayLabel(entry, root.nameMap)
+    readonly property string firmwareText: Model.firmwareLabel(entry)
     readonly property bool rowSelected: root.cursorActive && root.selectedIndex === rowIndex && !root.departing
+    readonly property bool menuOpen: root.menuEntryId === entryId && root.renamingId === ""
+    readonly property bool renaming: root.renamingId === entryId
 
     hasCursor: rowSelected
     current: !!(entry && entry.current)
@@ -567,66 +821,189 @@ Panel {
       cursorShape: Qt.PointingHandCursor
       onContainsMouseChanged: if (containsMouse && !root.departing) {
         root.cursorActive = true
-        root.selectedIndex = row.rowIndex
+        if (root.selectedIndex !== row.rowIndex) {
+          root.selectedIndex = row.rowIndex
+          root.actionFocused = false
+          if (root.menuEntryId !== "" && root.menuEntryId !== row.entryId) root.menuEntryId = ""
+        }
       }
-      onClicked: if (!root.departing) root.beginDeparture(row.entry ? row.entry.id : "")
+      onClicked: {
+        if (root.departing || root.renamingId !== "" || root.suppressActivate) return
+        if (root.menuEntryId === row.entryId) {
+          root.menuEntryId = ""
+          return
+        }
+        root.actionFocused = false
+        if (root.showingHidden) root.unhideEntry(row.entryId)
+        else root.beginDeparture(row.entryId)
+      }
     }
 
     PanelToolTip {
-      visible: rowMouse.containsMouse && !root.departing
-      text: "Reboot into " + Model.plain(row.entry ? row.entry.label : "")
+      visible: rowMouse.containsMouse && !root.departing && !root.actionFocused && !row.menuOpen && !row.renaming
+      text: root.showingHidden
+        ? "Show " + Model.plain(row.shownLabel) + " again"
+        : "Reboot into " + Model.plain(row.shownLabel)
       fontFamily: root.fontFamily
     }
 
-    Item {
+    Column {
       id: rowBody
       anchors.left: parent.left
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
       anchors.leftMargin: Style.spacing.rowPaddingX
       anchors.rightMargin: Style.spacing.rowPaddingX
-      implicitHeight: Math.max(osIcon.implicitHeight, info.implicitHeight)
+      spacing: Style.spacing.xs
 
-      Text {
-        id: osIcon
-        text: Model.iconFor(row.entry)
-        textFormat: Text.PlainText
-        color: root.foreground
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.heading
-        anchors.left: parent.left
-        anchors.verticalCenter: parent.verticalCenter
-      }
-
-      Column {
-        id: info
-        anchors.left: osIcon.right
-        anchors.leftMargin: Style.spacing.lg
-        anchors.right: parent.right
-        anchors.verticalCenter: parent.verticalCenter
-        spacing: Style.space(1)
+      Item {
+        id: mainLine
+        width: parent.width
+        implicitHeight: Math.max(osIcon.implicitHeight, info.implicitHeight, moreBtn.implicitHeight)
 
         Text {
-          width: parent.width
-          text: Model.plain(row.entry && row.entry.label ? row.entry.label : "Operating system")
+          id: osIcon
+          text: Model.iconFor(row.entry)
           textFormat: Text.PlainText
           color: root.foreground
           font.family: root.fontFamily
-          font.pixelSize: Style.font.body
-          elide: Text.ElideRight
+          font.pixelSize: Style.font.heading
+          anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
         }
 
-        Text {
-          width: parent.width
-          visible: detail !== ""
-          text: detail
-          textFormat: Text.PlainText
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          elide: Text.ElideRight
+        Column {
+          id: info
+          anchors.left: osIcon.right
+          anchors.leftMargin: Style.spacing.lg
+          anchors.right: moreBtn.left
+          anchors.rightMargin: Style.spacing.sm
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: Style.space(1)
 
-          readonly property string detail: Model.rowDetail(row.entry)
+          Text {
+            width: parent.width
+            visible: !row.renaming
+            text: Model.plain(row.shownLabel)
+            textFormat: Text.PlainText
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            elide: Text.ElideRight
+          }
+
+          TextField {
+            id: nameField
+            property bool renameArmed: false
+            visible: row.renaming
+            width: parent.width
+            foreground: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            verticalPadding: Style.space(2)
+            horizontalPadding: Style.space(6)
+            maximumLength: 80
+            selectByMouse: true
+            placeholderText: row.firmwareText !== "" ? row.firmwareText : "Name"
+            onVisibleChanged: {
+              if (!visible) {
+                renameArmed = false
+                return
+              }
+              Qt.callLater(function() {
+                if (root.renamingId !== row.entryId) return
+                nameField.renameArmed = true
+                nameField.text = row.shownLabel
+                nameField.forceActiveFocus()
+                nameField.selectAll()
+              })
+            }
+            onAccepted: root.commitRename(row.entryId, text)
+            Keys.onEscapePressed: function(event) {
+              event.accepted = true
+              root.cancelRename()
+            }
+            onActiveFocusChanged: {
+              if (!renameArmed || root.renamingId !== row.entryId) return
+              root.renameFieldActive = activeFocus
+              if (!activeFocus) root.commitRename(row.entryId, text)
+            }
+          }
+
+          Text {
+            width: parent.width
+            visible: detail !== ""
+            text: detail
+            textFormat: Text.PlainText
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+
+            readonly property string detail: Model.rowDetail(row.entry, root.nameMap)
+          }
+        }
+
+        PanelActionButton {
+          id: moreBtn
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          iconText: "⋮"
+          tooltipText: root.showingHidden ? "Rename or unhide" : "Rename or hide"
+          foreground: root.foreground
+          hoverColor: root.foreground
+          fontFamily: root.fontFamily
+          fontSize: Style.font.body
+          hasCursor: row.rowSelected && root.actionFocused && !row.menuOpen
+          onHovered: function(isHovered) {
+            if (!isHovered) {
+              if (rowMouse.containsMouse) root.actionFocused = false
+              return
+            }
+            if (root.departing) return
+            root.cursorActive = true
+            root.selectedIndex = row.rowIndex
+            root.actionFocused = true
+            if (root.menuEntryId !== "" && root.menuEntryId !== row.entryId) root.menuEntryId = ""
+          }
+          onClicked: if (!root.departing) root.toggleRowMenu(row.entryId)
+        }
+      }
+
+      Column {
+        width: parent.width
+        spacing: Style.spacing.xs
+        visible: row.menuOpen
+
+        Button {
+          width: parent.width
+          text: "Rename"
+          leftAlign: true
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          fontSize: Style.font.bodySmall
+          verticalPadding: Style.space(4)
+          horizontalPadding: Style.space(8)
+          hasCursor: row.menuOpen && root.menuAction === 0
+          onClicked: root.startRename(row.entryId)
+          onHovered: function(isHovered) { if (isHovered) root.menuAction = 0 }
+        }
+
+        Button {
+          width: parent.width
+          text: root.showingHidden ? "Unhide" : "Hide"
+          leftAlign: true
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          fontSize: Style.font.bodySmall
+          verticalPadding: Style.space(4)
+          horizontalPadding: Style.space(8)
+          hasCursor: row.menuOpen && root.menuAction === 1
+          onClicked: {
+            if (root.showingHidden) root.unhideEntry(row.entryId)
+            else root.hideEntry(row.entryId)
+          }
+          onHovered: function(isHovered) { if (isHovered) root.menuAction = 1 }
         }
       }
     }
