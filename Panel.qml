@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Controls as Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -18,6 +19,11 @@ Panel {
 
   readonly property string cli: {
     var url = Qt.resolvedUrl("bin/target-boot").toString()
+    if (url.indexOf("file://") === 0) url = url.substring(7)
+    try { return decodeURIComponent(url) } catch (e) { return url }
+  }
+  readonly property string clipboardCli: {
+    var url = Qt.resolvedUrl("bin/read-clipboard").toString()
     if (url.indexOf("file://") === 0) url = url.substring(7)
     try { return decodeURIComponent(url) } catch (e) { return url }
   }
@@ -1091,41 +1097,160 @@ Panel {
             elide: Text.ElideRight
           }
 
-          TextField {
-            id: nameField
-            property bool renameArmed: false
-            visible: row.renaming
+          // One editor, and only while this row is being renamed. A hidden
+          // line editor still subscribes to clipboard changes. TextArea checks
+          // mime types on those changes and does not read the clipboard body.
+          // Paste is a capped read in bin/read-clipboard, outside the shell.
+          Loader {
+            id: nameLoader
+            active: root.opened && row.renaming
+            visible: active
             width: parent.width
-            foreground: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.body
-            verticalPadding: Style.space(2)
-            horizontalPadding: Style.space(6)
-            maximumLength: 80
-            selectByMouse: true
-            placeholderText: row.firmwareText !== "" ? row.firmwareText : "Name"
-            onVisibleChanged: {
-              if (!visible) {
-                renameArmed = false
-                return
+            sourceComponent: renameEditor
+          }
+
+          Component {
+            id: renameEditor
+            Controls.TextArea {
+              id: nameField
+              property bool renameArmed: false
+              readonly property var borderSpec: Border.controlSpec(activeFocus ? "focus" : (hovered ? "hover-cursor" : "normal"), root.foreground, Color.accent)
+              width: nameLoader.width
+              textFormat: TextEdit.PlainText
+              wrapMode: TextEdit.Wrap
+              selectByMouse: true
+              activeFocusOnTab: false
+              placeholderText: "Name"
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              color: root.foreground
+              selectionColor: Style.selectionFillFor(root.foreground, Color.accent)
+              selectedTextColor: root.foreground
+              placeholderTextColor: Qt.darker(root.foreground, 1.6)
+              leftPadding: Style.space(6) + Border.left(borderSpec)
+              rightPadding: Style.space(6) + Border.right(borderSpec)
+              topPadding: Style.space(2) + Border.top(borderSpec)
+              bottomPadding: Style.space(2) + Border.bottom(borderSpec)
+              background: BorderSurface {
+                color: Style.controlFill(nameField.activeFocus, nameField.hovered, root.foreground, Color.accent)
+                borderSpec: nameField.borderSpec
+                radius: Style.cornerRadius
               }
-              Qt.callLater(function() {
-                if (root.renamingId !== row.entryId) return
-                nameField.renameArmed = true
-                nameField.text = row.shownLabel
-                nameField.forceActiveFocus()
-                nameField.selectAll()
-              })
-            }
-            onAccepted: root.commitRename(row.entryId, text)
-            Keys.onEscapePressed: function(event) {
-              event.accepted = true
-              root.cancelRename()
-            }
-            onActiveFocusChanged: {
-              if (!renameArmed || root.renamingId !== row.entryId) return
-              root.renameFieldActive = activeFocus
-              if (!activeFocus) root.commitRename(row.entryId, text)
+              Controls.ContextMenu.menu: null
+
+              Keys.priority: Keys.BeforeItem
+              Keys.onShortcutOverride: function(event) {
+                if (event.matches(StandardKey.Paste)) event.accepted = true
+              }
+              Keys.onPressed: function(event) {
+                if (event.matches(StandardKey.Paste)) {
+                  nameField.boundedPaste(false)
+                  event.accepted = true
+                  return
+                }
+                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                  if (event.isAutoRepeat) {
+                    event.accepted = true
+                    return
+                  }
+                  root.commitRename(row.entryId, nameField.text)
+                  event.accepted = true
+                  return
+                }
+                if (event.key === Qt.Key_Escape) {
+                  root.cancelRename()
+                  event.accepted = true
+                }
+              }
+              onTextChanged: if (length > 80) remove(80, length)
+              onActiveFocusChanged: {
+                if (!renameArmed || root.renamingId !== row.entryId) return
+                root.renameFieldActive = activeFocus
+                if (!activeFocus) root.commitRename(row.entryId, text)
+              }
+              Component.onCompleted: {
+                Qt.callLater(function() {
+                  if (root.renamingId !== row.entryId) return
+                  nameField.renameArmed = true
+                  nameField.text = row.shownLabel
+                  nameField.forceActiveFocus()
+                  nameField.selectAll()
+                })
+              }
+              Component.onDestruction: if (pasteProc.running) pasteProc.signal(15)
+
+              MouseArea {
+                anchors.fill: parent
+                acceptedButtons: Qt.MiddleButton
+                cursorShape: Qt.IBeamCursor
+                onPressed: function(mouse) {
+                  nameField.forceActiveFocus()
+                  nameField.cursorPosition = nameField.positionAt(mouse.x, mouse.y)
+                }
+                onClicked: nameField.boundedPaste(true)
+              }
+
+              function boundedPaste(primary) {
+                if (readOnly || !enabled || pasteProc.running) return
+                pasteProc.previousText = text
+                pasteProc.selStart = selectionStart
+                pasteProc.selEnd = selectionEnd
+                pasteProc.cursor = cursorPosition
+                pasteProc.buf = ""
+                pasteProc.dropped = false
+                pasteProc.command = [
+                  "/usr/bin/timeout", "-k", "1", "--", "2",
+                  "/usr/bin/bash", root.clipboardCli,
+                  primary ? "primary" : "clipboard"
+                ]
+                pasteProc.running = true
+              }
+
+              Process {
+                id: pasteProc
+                property string previousText
+                property int selStart
+                property int selEnd
+                property int cursor
+                property string buf
+                property bool dropped: false
+                stdout: SplitParser {
+                  splitMarker: ""
+                  onRead: function(chunk) {
+                    if (pasteProc.dropped) return
+                    var next = pasteProc.buf + chunk
+                    if (next.length > 400) {
+                      pasteProc.dropped = true
+                      pasteProc.buf = ""
+                      pasteProc.signal(15)
+                      pasteKill.start()
+                      return
+                    }
+                    pasteProc.buf = next
+                  }
+                }
+                onExited: function(code) {
+                  if (pasteProc.dropped || code !== 0 || !nameField.activeFocus) return
+                  if (root.renamingId !== row.entryId) return
+                  if (nameField.text !== pasteProc.previousText) return
+                  if (nameField.cursorPosition !== pasteProc.cursor) return
+                  if (nameField.selectionStart !== pasteProc.selStart || nameField.selectionEnd !== pasteProc.selEnd) return
+                  var value = pasteProc.buf.replace(/[\u0000-\u001F\u007F\u2028\u2029]/g, "")
+                  value = value.replace(/[<>&]/g, "")
+                  var room = 80 - (nameField.length - (pasteProc.selEnd - pasteProc.selStart))
+                  if (room < 1 || !value) return
+                  if (value.length > room) value = value.slice(0, room)
+                  nameField.remove(pasteProc.selStart, pasteProc.selEnd)
+                  nameField.insert(pasteProc.selStart, value)
+                  nameField.cursorPosition = pasteProc.selStart + value.length
+                }
+              }
+
+              Timer {
+                id: pasteKill
+                interval: 1000
+                onTriggered: pasteProc.signal(9)
+              }
             }
           }
 

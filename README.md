@@ -189,6 +189,10 @@ omarchy plugin validate .
 
 ## Changelog
 
+### 1.2.1
+
+- Rename opens one plain-text field for the row being edited, and only while that field is open. Paste reads a short clipboard excerpt outside the shell and stops after one second.
+
 ### 1.2.0
 
 - The countdown is four beats, about six seconds. The new first line is “Next boot will be …, just this once.”
