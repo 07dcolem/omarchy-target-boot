@@ -50,6 +50,36 @@ Panel {
   property string renamingId: ""
   property bool renameFieldActive: false
   property bool suppressActivate: false
+  readonly property bool offerSeen: setting("offerSeen", false) === true
+  property bool offering: false
+  property string offerId: ""
+  property string offerLabel: ""
+  property string offerTyped: ""
+  property int offerShown: 0
+  property int offerChoice: 0
+  // 0 is the start of the open. 1 is the settled menu.
+  property real boot: 1
+  readonly property real arrowScale: {
+    if (boot < 0.34) return 0.28 + (boot / 0.34) * 0.56
+    if (boot < 0.74) return 0.84 - ((boot - 0.34) / 0.4) * 0.4
+    return 0.44
+  }
+  readonly property real arrowOpacity: {
+    if (boot < 0.16) return boot / 0.16
+    if (boot < 0.58) return 1
+    if (boot < 0.9) return 1 - ((boot - 0.58) / 0.32) * 0.84
+    return 0.16
+  }
+  readonly property real arrowTurn: {
+    var t = Math.min(1, boot / 0.7)
+    return (1 - Math.pow(1 - t, 3)) * 720
+  }
+  readonly property real listReveal: {
+    var t = (boot - 0.48) / 0.42
+    if (t <= 0) return 0
+    if (t >= 1) return 1
+    return t
+  }
 
   property bool departing: false
   property int departChoice: 0
@@ -141,6 +171,11 @@ Panel {
 
   function moveCursor(dx, dy) {
     if (renamingId !== "") return
+    if (offering) {
+      if (Number(dx) < 0 || Number(dy) < 0) offerChoice = 0
+      else if (Number(dx) > 0 || Number(dy) > 0) offerChoice = 1
+      return
+    }
     if (departing) {
       if (busy || committed || rushing) return
       cursorActive = true
@@ -173,6 +208,11 @@ Panel {
 
   function activateCursor() {
     if (renamingId !== "" || suppressActivate) return
+    if (offering) {
+      if (offerChoice === 0) acceptOffer()
+      else declineOffer()
+      return
+    }
     if (departing) {
       if (!busy && !committed && !rushing) onCountdownEnter(false)
       return
@@ -206,7 +246,7 @@ Panel {
   }
 
   function beginDeparture(id) {
-    if (busy || committed || rushing) return
+    if (offering || busy || committed || rushing) return
     var clean = Model.normalizeId(id)
     if (!clean) {
       errorText = "Boot id must be four hex digits"
@@ -353,13 +393,14 @@ Panel {
 
   // The shell replaces the whole widget entry on write, so keys other than
   // the name map and the hidden list have to be copied across.
-  function persistPreferences(names, hidden) {
+  function persistPreferences(names, hidden, seen) {
     var entry = { id: moduleName }
     var current = settings || {}
     for (var key in current) {
-      if (key === "id" || key === "names" || key === "hidden") continue
+      if (key === "id" || key === "names" || key === "hidden" || key === "offerSeen") continue
       entry[key] = current[key]
     }
+    if (seen === true || current.offerSeen === true) entry.offerSeen = true
     var cleanNames = Model.sanitizeNames(names)
     var cleanHidden = Model.sanitizeHidden(hidden)
     var named = false
@@ -472,6 +513,44 @@ Panel {
     Qt.callLater(function() { persistPreferences(keptNames, nextHidden) })
   }
 
+  function syncOffer() {
+    if (offerSeen) {
+      offering = false
+      offerType.stop()
+      return
+    }
+    var target = Model.offerTarget(firmware, nameMap, offerSeen)
+    if (!target) {
+      offering = false
+      offerType.stop()
+      return
+    }
+    offerId = target.id
+    offerLabel = target.label
+    if (!offering) {
+      offering = true
+      offerChoice = 0
+      offerShown = 0
+      offerTyped = ""
+      offerType.restart()
+    }
+  }
+
+  function acceptOffer() {
+    if (!offering || offerId === "") return
+    var nextNames = Model.withName(nameMap, offerId, "Omarchy")
+    offering = false
+    offerType.stop()
+    persistPreferences(nextNames, hiddenIds, true)
+  }
+
+  function declineOffer() {
+    if (!offering) return
+    offering = false
+    offerType.stop()
+    persistPreferences(nameMap, hiddenIds, true)
+  }
+
   function applyList(code, stdout) {
     var parsed = Model.parsePayload(stdout)
     if (code !== 0 || !parsed.ok || !Array.isArray(parsed.bootOrder)) {
@@ -482,18 +561,23 @@ Panel {
     firmware = parsed
     payloadText = stdout
     syncCursor()
+    if (opened) syncOffer()
   }
 
   onStatusLineChanged: if (departing && !rushing) shownLine = ""
   onDepartingChanged: if (departing) playArrive()
   // Settings can change while the item is still being created. Defer the
   // cursor update so the name map and hidden list exist first.
-  onSettingsChanged: Qt.callLater(syncCursor)
+  onSettingsChanged: Qt.callLater(function() { syncCursor(); syncOffer() })
   onOpenedChanged: {
     if (opened) {
+      bootAnim.restart()
+      syncOffer()
       refresh()
       return
     }
+    offering = false
+    offerType.stop()
     renamingId = ""
     renameFieldActive = false
     suppressActivate = false
@@ -533,6 +617,31 @@ Panel {
     interval: Model.flickMs()
     repeat: false
     onTriggered: root.advanceFlick()
+  }
+
+  Timer {
+    id: offerType
+    interval: Model.typeMs()
+    repeat: true
+    onTriggered: {
+      var line = Model.offerLine(root.offerLabel)
+      if (root.offerShown >= line.length) {
+        stop()
+        return
+      }
+      root.offerShown += 1
+      root.offerTyped = line.slice(0, root.offerShown)
+    }
+  }
+
+  NumberAnimation {
+    id: bootAnim
+    target: root
+    property: "boot"
+    from: 0
+    to: 1
+    duration: 1100
+    easing.type: Easing.Linear
   }
 
   Timer {
@@ -703,7 +812,8 @@ Panel {
       onActivateRequested: root.activateCursor()
       onReturnRequested: root.onCountdownEnter(root.shiftHeld)
       onCloseRequested: {
-        if (root.renamingId !== "") root.cancelRename()
+        if (root.offering) root.close()
+        else if (root.renamingId !== "") root.cancelRename()
         else if (root.menuEntryId !== "") root.menuEntryId = ""
         else if (root.showingHidden) root.closeHidden()
         else if (root.departing && !root.busy && !root.committed) root.cancelDeparture()
@@ -724,7 +834,7 @@ Panel {
       }
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(text) {
-        if (root.renamingId !== "" || root.departing) return
+        if (root.offering || root.renamingId !== "" || root.departing) return
         if (text === "r") root.refresh()
         else if (text === "." && !root.onHiddenButton()) {
           var rows = root.listedEntries
@@ -733,9 +843,32 @@ Panel {
         }
       }
 
+      Item {
+        id: screen
+        anchors.fill: parent
+
+        RestartArrow {
+          anchors.centerIn: parent
+          width: Math.min(parent.width, parent.height) * root.arrowScale
+          height: width
+          rotation: root.arrowTurn
+          opacity: root.arrowOpacity
+          ink: root.foreground
+        }
+
+        Item {
+          id: listMask
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.top: parent.top
+          height: Math.max(0, parent.height * root.listReveal)
+          clip: true
+          z: 1
+
       Flickable {
         id: scroller
-        anchors.fill: parent
+        width: screen.width
+        height: screen.height
         contentWidth: width
         contentHeight: column.implicitHeight
         clip: true
@@ -785,17 +918,137 @@ Panel {
             id: stage
             width: parent.width
             clip: true
-            implicitHeight: root.departing ? departBlock.implicitHeight : listBlock.implicitHeight
+            implicitHeight: root.departing ? departBlock.implicitHeight : (root.offering ? offerBlock.implicitHeight : listBlock.implicitHeight)
 
             Behavior on implicitHeight {
               NumberAnimation { duration: 180; easing.type: Easing.OutCubic }
             }
 
             Column {
+              id: offerBlock
+              width: parent.width
+              spacing: Style.spacing.md
+              visible: root.offering && !root.departing
+
+              Row {
+                spacing: Style.space(10)
+                anchors.horizontalCenter: parent.horizontalCenter
+
+                Repeater {
+                  model: 3
+
+                  Text {
+                    required property int index
+                    text: index === 1 ? "✦" : "✧"
+                    textFormat: Text.PlainText
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: index === 1 ? Style.font.heading : Style.font.body
+                    opacity: root.offerShown > 0 ? (index === 1 ? 0.95 : 0.45) : 0
+                    scale: root.offerShown > 0 ? 1 : 0.2
+                    transformOrigin: Item.Center
+
+                    Behavior on opacity { NumberAnimation { duration: 240 } }
+                    Behavior on scale { NumberAnimation { duration: 320; easing.type: Easing.OutBack } }
+                  }
+                }
+              }
+
+              Text {
+                width: parent.width
+                text: root.offerTyped
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+
+              Row {
+                width: parent.width
+                spacing: Style.spacing.sm
+
+                Item {
+                  width: (parent.width - parent.spacing) / 2
+                  implicitHeight: callColumn.implicitHeight
+                  height: callColumn.implicitHeight
+
+                  Column {
+                    id: callColumn
+                    width: parent.width
+                    spacing: Style.space(4)
+
+                    Text {
+                      width: parent.width
+                      text: "Call it Omarchy"
+                      textFormat: Text.PlainText
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      font.bold: root.offerChoice === 0
+                    }
+
+                    Rectangle {
+                      height: 2
+                      width: root.offerChoice === 0 ? parent.width : 0
+                      color: root.foreground
+                      Behavior on width { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
+                    }
+                  }
+
+                  MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    hoverEnabled: true
+                    onContainsMouseChanged: if (containsMouse) root.offerChoice = 0
+                    onClicked: root.acceptOffer()
+                  }
+                }
+
+                Item {
+                  width: (parent.width - parent.spacing) / 2
+                  implicitHeight: keepColumn.implicitHeight
+                  height: keepColumn.implicitHeight
+
+                  Column {
+                    id: keepColumn
+                    width: parent.width
+                    spacing: Style.space(4)
+
+                    Text {
+                      width: parent.width
+                      text: "Keep this name"
+                      textFormat: Text.PlainText
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      font.bold: root.offerChoice === 1
+                    }
+
+                    Rectangle {
+                      height: 2
+                      width: root.offerChoice === 1 ? parent.width : 0
+                      color: root.foreground
+                      Behavior on width { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
+                    }
+                  }
+
+                  MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    hoverEnabled: true
+                    onContainsMouseChanged: if (containsMouse) root.offerChoice = 1
+                    onClicked: root.declineOffer()
+                  }
+                }
+              }
+            }
+
+            Column {
               id: listBlock
               width: parent.width
               spacing: Style.spacing.xs
-              opacity: root.departing ? 0 : 1
+              opacity: root.departing || root.offering ? 0 : 1
               visible: opacity > 0
 
               Behavior on opacity { NumberAnimation { duration: 180; easing.type: Easing.OutQuad } }
@@ -944,30 +1197,22 @@ Panel {
                 spacing: Style.spacing.sm
                 visible: root.departing && !root.rushing && !root.busy && !root.committed
 
-                Button {
+                BracketButton {
                   width: (departActions.width - departActions.spacing) / 2
-                  text: "Stay here"
-                  tooltipText: "Enter when highlighted"
-                  bordered: true
-                  hasCursor: root.departChoice === 0
-                  foreground: root.foreground
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.body
-                  onClicked: root.cancelDeparture()
-                  onHovered: function(isHovered) { if (isHovered) root.departChoice = 0 }
+                  label: "Stay here"
+                  tip: "Enter when highlighted"
+                  hot: root.departChoice === 0
+                  onTriggered: root.cancelDeparture()
+                  onHoveredIn: root.departChoice = 0
                 }
 
-                Button {
+                BracketButton {
                   width: (departActions.width - departActions.spacing) / 2
-                  text: "Go now"
-                  tooltipText: "Or press Shift+Enter"
-                  bordered: true
-                  hasCursor: root.departChoice === 1
-                  foreground: root.foreground
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.body
-                  onClicked: root.skipDeparture()
-                  onHovered: function(isHovered) { if (isHovered) root.departChoice = 1 }
+                  label: "Go now"
+                  tip: "Or press Shift+Enter"
+                  hot: root.departChoice === 1
+                  onTriggered: root.skipDeparture()
+                  onHoveredIn: root.departChoice = 1
                 }
               }
             }
@@ -996,6 +1241,162 @@ Panel {
           }
         }
       }
+        }
+      }
+    }
+  }
+
+  // A circle with an arrow head. Width and height stay equal, and the whole
+  // mark rotates, so the arrow stays round.
+  component RestartArrow: Canvas {
+    id: arrow
+    property color ink: root.foreground
+    antialiasing: true
+
+    onPaint: {
+      var ctx = getContext("2d")
+      if (!ctx) return
+      ctx.clearRect(0, 0, width, height)
+      var side = Math.min(width, height)
+      var cx = width / 2
+      var cy = height / 2
+      var weight = Math.max(4, side * 0.075)
+      var radius = side * 0.36
+      // Head sits on the right and points down along the circle, not on top.
+      var end = 0
+      var start = end - Math.PI * 1.62
+      ctx.strokeStyle = arrow.ink
+      ctx.fillStyle = arrow.ink
+      ctx.lineWidth = weight
+      ctx.lineCap = "round"
+      ctx.beginPath()
+      ctx.arc(cx, cy, radius, start, end - 0.08, false)
+      ctx.stroke()
+      // Clockwise on this canvas is increasing angle. The head continues that way.
+      var dir = end + Math.PI / 2
+      var ux = Math.cos(dir)
+      var uy = Math.sin(dir)
+      var px = -uy
+      var py = ux
+      var head = weight * 2.7
+      var tx = cx + radius * Math.cos(end)
+      var ty = cy + radius * Math.sin(end)
+      ctx.beginPath()
+      ctx.moveTo(tx + ux * head, ty + uy * head)
+      ctx.lineTo(tx + px * head * 0.78, ty + py * head * 0.78)
+      ctx.lineTo(tx - px * head * 0.78, ty - py * head * 0.78)
+      ctx.closePath()
+      ctx.fill()
+    }
+    onWidthChanged: requestPaint()
+    onHeightChanged: requestPaint()
+    onInkChanged: requestPaint()
+    Component.onCompleted: requestPaint()
+  }
+
+  // The square Omarchy mark at the same size as the other row glyphs.
+  component OmarchyMark: Canvas {
+    id: mark
+    property color ink: root.foreground
+    readonly property var rows: Model.omarchyMarkRows()
+    readonly property real cell: 1
+    width: 15 * cell
+    height: 15 * cell
+    antialiasing: false
+
+    onPaint: {
+      var ctx = getContext("2d")
+      if (!ctx) return
+      ctx.clearRect(0, 0, width, height)
+      ctx.fillStyle = mark.ink
+      var bits = mark.rows
+      var size = mark.cell
+      for (var y = 0; y < bits.length; y++) {
+        var line = bits[y]
+        for (var x = 0; x < line.length; x++) {
+          if (line.charAt(x) === "1") ctx.fillRect(x * size, y * size, size, size)
+        }
+      }
+    }
+    onInkChanged: requestPaint()
+    Component.onCompleted: requestPaint()
+  }
+
+  // Corner ticks and one star. The operating-system rows use a shine instead.
+  component BracketButton: Item {
+    id: bracket
+    property string label: ""
+    property string tip: ""
+    property bool hot: false
+    signal triggered()
+    signal hoveredIn()
+    implicitHeight: button.implicitHeight
+
+    Button {
+      id: button
+      anchors.left: parent.left
+      anchors.right: parent.right
+      text: bracket.label
+      tooltipText: bracket.tip
+      bordered: true
+      hasCursor: bracket.hot
+      foreground: root.foreground
+      fontFamily: root.fontFamily
+      fontSize: Style.font.body
+      onClicked: bracket.triggered()
+      onHovered: function(isHovered) { if (isHovered) bracket.hoveredIn() }
+    }
+
+    Rectangle {
+      width: Style.space(8)
+      height: 2
+      color: root.foreground
+      opacity: bracket.hot ? 1 : 0
+      anchors.left: parent.left
+      anchors.top: parent.top
+      Behavior on opacity { NumberAnimation { duration: 140 } }
+    }
+    Rectangle {
+      width: 2
+      height: Style.space(8)
+      color: root.foreground
+      opacity: bracket.hot ? 1 : 0
+      anchors.left: parent.left
+      anchors.top: parent.top
+      Behavior on opacity { NumberAnimation { duration: 140 } }
+    }
+    Rectangle {
+      width: Style.space(8)
+      height: 2
+      color: root.foreground
+      opacity: bracket.hot ? 1 : 0
+      anchors.right: parent.right
+      anchors.bottom: parent.bottom
+      Behavior on opacity { NumberAnimation { duration: 140 } }
+    }
+    Rectangle {
+      width: 2
+      height: Style.space(8)
+      color: root.foreground
+      opacity: bracket.hot ? 1 : 0
+      anchors.right: parent.right
+      anchors.bottom: parent.bottom
+      Behavior on opacity { NumberAnimation { duration: 140 } }
+    }
+    Text {
+      text: "✦"
+      textFormat: Text.PlainText
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      opacity: bracket.hot ? 1 : 0
+      scale: bracket.hot ? 1 : 0.4
+      transformOrigin: Item.Center
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      Behavior on opacity { NumberAnimation { duration: 140 } }
+      Behavior on scale { NumberAnimation { duration: 160; easing.type: Easing.OutBack } }
     }
   }
 
@@ -1011,8 +1412,10 @@ Panel {
     readonly property bool rowSelected: root.cursorActive && root.selectedIndex === rowIndex && !root.departing
     readonly property bool menuOpen: root.menuEntryId === entryId && root.renamingId === ""
     readonly property bool renaming: root.renamingId === entryId
+    readonly property bool omarchy: Model.iconFor(entry, root.nameMap) === Model.omarchyIcon()
 
     hasCursor: rowSelected
+    onRowSelectedChanged: if (rowSelected && !renaming) shineSweep.restart()
     current: !!(entry && entry.current)
     foreground: root.foreground
     fill: root.hoverFill
@@ -1064,17 +1467,30 @@ Panel {
       Item {
         id: mainLine
         width: parent.width
-        implicitHeight: Math.max(osIcon.implicitHeight, info.implicitHeight, moreBtn.implicitHeight)
+        implicitHeight: Math.max(osIcon.height, info.implicitHeight, moreBtn.implicitHeight)
 
-        Text {
+        Item {
           id: osIcon
-          text: Model.iconFor(row.entry)
-          textFormat: Text.PlainText
-          color: root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.heading
+          width: row.omarchy ? omarchyGlyph.width : osGlyph.implicitWidth
+          height: row.omarchy ? omarchyGlyph.height : osGlyph.implicitHeight
           anchors.left: parent.left
           anchors.verticalCenter: parent.verticalCenter
+
+          Text {
+            id: osGlyph
+            visible: !row.omarchy
+            text: row.omarchy ? "" : Model.iconFor(row.entry, root.nameMap)
+            textFormat: Text.PlainText
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.heading
+          }
+
+          OmarchyMark {
+            id: omarchyGlyph
+            visible: row.omarchy
+            ink: root.foreground
+          }
         }
 
         Column {
@@ -1329,6 +1745,31 @@ Panel {
           }
           onHovered: function(isHovered) { if (isHovered) root.menuAction = 1 }
         }
+      }
+    }
+
+    Item {
+      anchors.fill: parent
+      clip: true
+
+      Rectangle {
+        id: beam
+        width: Style.space(18)
+        height: parent.height * 2
+        y: -parent.height * 0.5
+        rotation: -28
+        transformOrigin: Item.Center
+        color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.22)
+      }
+
+      NumberAnimation {
+        id: shineSweep
+        target: beam
+        property: "x"
+        from: -beam.width
+        to: row.width
+        duration: 520
+        easing.type: Easing.OutCubic
       }
     }
   }

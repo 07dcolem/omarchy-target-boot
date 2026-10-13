@@ -26,6 +26,24 @@ assert.strictEqual(Model.plain("Windows <img>"), "Windows img")
 assert.strictEqual(Model.iconFor(entry({ label: "Windows Boot Manager" })), "󰖳")
 assert.strictEqual(Model.iconFor(entry({ file: "\\EFI\\MICROSOFT\\BOOT\\BOOTMGFW.EFI", label: "OS" })), "󰖳")
 assert.strictEqual(Model.iconFor(entry({ label: "Limine" })), "󰋊")
+assert.strictEqual(Model.iconFor(entry({ label: "Omarchy" })), Model.omarchyIcon())
+assert.strictEqual(Model.iconFor(entry({ id: "0005", label: "Limine" }), { "0005": "Omarchy" }), Model.omarchyIcon())
+assert.strictEqual(Model.iconFor(entry({ label: "Windows", file: "omarchy" })), "󰖳")
+
+assert.strictEqual(Model.omarchyIcon(), "omarchy")
+assert.notStrictEqual(Model.iconFor(entry({ label: "Limine" })), Model.omarchyIcon())
+const mark = Model.omarchyMarkRows()
+assert.strictEqual(mark.length, 15)
+assert.ok(mark.every((row) => row.length === 15 && /^[01]+$/.test(row)))
+assert.ok(mark[0].includes("1") && mark[13].includes("0"))
+
+const limine = { entries: [entry({ id: "0005", label: "Limine", current: true })] }
+assert.deepStrictEqual(Model.offerTarget(limine, {}, false), { id: "0005", label: "Limine" })
+assert.strictEqual(Model.offerTarget(limine, {}, true), null)
+assert.strictEqual(Model.offerTarget(limine, { "0005": "Omarchy" }, false), null)
+assert.strictEqual(Model.offerTarget({ entries: [entry({ id: "0001", label: "Windows", current: false })] }, {}, false), null)
+assert.strictEqual(Model.offerLine("Limine"), "This boot is Limine. Call it Omarchy in this menu?")
+assert.ok(!Model.offerLine("x".repeat(200)).includes("x".repeat(81)))
 
 const firmware = {
   entries: [

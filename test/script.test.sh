@@ -144,4 +144,102 @@ paste_status=$?
 set -e
 [ "$paste_status" -eq 2 ]
 
+grep -q 'component RestartArrow' "$root/Panel.qml"
+grep -q 'bootAnim.restart' "$root/Panel.qml"
+grep -q 'ctx.arc' "$root/Panel.qml"
+grep -q 'component OmarchyMark' "$root/Panel.qml"
+if grep -n -E 'logo\.svg|Wordmark|ColorOverlay' "$root/Panel.qml"; then
+  echo "omarchy artwork is still in the panel" >&2
+  exit 1
+fi
+grep -q 'rotation: -28' "$root/Panel.qml"
+grep -q 'component BracketButton' "$root/Panel.qml"
+grep -q 'Call it Omarchy' "$root/Panel.qml"
+
+# A captured list is not a terminal, so it must not rewrite shell config.
+offer_home=$(mktemp -d)
+mkdir -p -- "$offer_home/omarchy"
+cat >"$offer_home/omarchy/shell.json" <<'EOF'
+{
+  "version": 1,
+  "bar": {
+    "layout": {
+      "left": [],
+      "center": [],
+      "right": [{ "id": "io.github.07dcolem.target-boot" }]
+    }
+  }
+}
+EOF
+cp -- "$offer_home/omarchy/shell.json" /tmp/reboot-into-shell-before.json
+XDG_CONFIG_HOME="$offer_home" "$cli" list --fixture "$fix" >/tmp/reboot-into-list.json
+cmp -s "$offer_home/omarchy/shell.json" /tmp/reboot-into-shell-before.json
+jq -e '.ok == true and .bootCurrent == "0005"' /tmp/reboot-into-list.json >/dev/null
+
+python3 - "$cli" "$fix" "$offer_home" <<'PY'
+import json, os, pty, select, subprocess, sys, time
+from pathlib import Path
+
+cli, fix, home = sys.argv[1:]
+shell = Path(home) / "omarchy" / "shell.json"
+original = shell.read_text()
+
+def run(answer, timeout=4):
+    env = os.environ.copy()
+    env["XDG_CONFIG_HOME"] = home
+    master, slave = pty.openpty()
+    proc = subprocess.Popen(
+        [cli, "list", "--fixture", fix],
+        stdin=slave, stdout=slave, stderr=slave, env=env,
+    )
+    os.close(slave)
+    buf = b""
+    sent = answer is None
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([master], [], [], 0.2)
+        if ready:
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            if not sent and b"Call it Omarchy" in buf:
+                os.write(master, answer)
+                sent = True
+        elif proc.poll() is not None:
+            break
+    if proc.poll() is None:
+        proc.kill()
+        proc.wait(timeout=1)
+    else:
+        proc.wait(timeout=1)
+    os.close(master)
+    return proc.returncode, buf.decode("utf-8", "replace")
+
+code, text = run(b"n\n")
+assert code == 0, text
+assert "Call it Omarchy" in text
+assert '"ok":true' in text
+row = json.loads(shell.read_text())["bar"]["layout"]["right"][0]
+assert row["offerSeen"] is True
+assert "0005" not in row.get("names", {})
+
+code, text = run(None)
+assert code == 0, text
+assert "Call it Omarchy" not in text
+
+shell.write_text(original)
+code, text = run(b"y\n")
+assert code == 0, text
+row = json.loads(shell.read_text())["bar"]["layout"]["right"][0]
+assert row["offerSeen"] is True
+assert row["names"]["0005"] == "Omarchy"
+print("offer pty ok")
+PY
+rm -rf -- "$offer_home"
+rm -f -- /tmp/reboot-into-list.json /tmp/reboot-into-shell-before.json
+
 echo "script.test.sh ok"

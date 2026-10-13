@@ -12,7 +12,7 @@
 set -euo pipefail
 IFS=$' \t\n'
 
-VERSION="1.2.1"
+VERSION="1.3.0"
 
 # Privileged programs are absolute paths. PATH is reset to system directories
 # before any other command is looked up, and nothing looked up on PATH is
@@ -63,6 +63,7 @@ sanitize_environment() {
       USER="${USER-}" \
       LOGNAME="${LOGNAME-${USER-}}" \
       XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR-}" \
+      XDG_CONFIG_HOME="${XDG_CONFIG_HOME-}" \
       DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS-}" \
       WAYLAND_DISPLAY="${WAYLAND_DISPLAY-}" \
       DISPLAY="${DISPLAY-}" \
@@ -330,8 +331,101 @@ auth_failure() {
   fail "Could not ${what}"
 }
 
+WIDGET_ID="io.github.07dcolem.target-boot"
+
+shell_config_path() {
+  if [[ -n ${XDG_CONFIG_HOME:-} ]]; then
+    printf '%s\n' "$XDG_CONFIG_HOME/omarchy/shell.json"
+    return
+  fi
+  [[ -n ${HOME:-} ]] || return 1
+  printf '%s\n' "$HOME/.config/omarchy/shell.json"
+}
+
+# Interactive list only. The panel captures stdout and is not a terminal,
+# so this never runs on the shell's refresh. A symlink is left untouched.
+maybe_offer_omarchy() {
+  [[ -t 0 && -t 1 ]] || return 0
+  local file current label file_path entry_file shown blob answer yes tmp dir present
+  file=$(shell_config_path) || return 0
+  [[ -f $file && ! -L $file ]] || return 0
+  present=$("$JQ" -r --arg id "$WIDGET_ID" '
+    [ .bar.layout.left[]?, .bar.layout.center[]?, .bar.layout.right[]?, .plugins[]? ]
+    | map(select(.id == $id)) | length
+  ' "$file") || return 0
+  [[ $present -ge 1 ]] || return 0
+  current=$("$JQ" -r 'first(.entries[] | select(.current == true) | .id) // ""' <<<"$PARSED")
+  [[ $current =~ ^[0-9A-F]{4}$ ]] || return 0
+  label=$("$JQ" -r --arg id "$current" 'first(.entries[] | select(.id == $id) | .label) // ""' <<<"$PARSED")
+  file_path=$("$JQ" -r --arg id "$current" 'first(.entries[] | select(.id == $id) | .path) // ""' <<<"$PARSED")
+  entry_file=$("$JQ" -r --arg id "$current" 'first(.entries[] | select(.id == $id) | .file) // ""' <<<"$PARSED")
+  shown=$("$JQ" -r --arg id "$WIDGET_ID" --arg boot "$current" '
+    [ .bar.layout.left[]?, .bar.layout.center[]?, .bar.layout.right[]?, .plugins[]? ]
+    | map(select(.id == $id)) | .[0] // {}
+    | if .offerSeen == true then "__seen__"
+      elif (.names[$boot] | type) == "string" and .names[$boot] != "" then .names[$boot]
+      else "" end
+  ' "$file") || return 0
+  [[ $shown == "__seen__" ]] && return 0
+  [[ -n $shown ]] || shown=$label
+  blob=$(printf '%s %s %s %s' "$shown" "$label" "$entry_file" "$file_path")
+  blob=${blob,,}
+  case $blob in
+    *windows*|*microsoft*|*bootmgfw*) ;;
+    *omarchy*) return 0 ;;
+  esac
+  shown=${shown//[$'<>&\r\n\t']/}
+  shown=${shown:0:80}
+  [[ -n $shown ]] || shown="this operating system"
+  printf 'This boot is %s (%s).\n' "$shown" "$current" >&2
+  printf 'Call it Omarchy in the Reboot into menu? [y/N] ' >&2
+  answer=""
+  IFS= read -r answer || true
+  answer=${answer:0:8}
+  yes=0
+  case ${answer,,} in
+    y|yes) yes=1 ;;
+  esac
+  dir=${file%/*}
+  umask 077
+  tmp=$(/usr/bin/mktemp -p "$dir" .reboot-into.XXXXXXXXXX) || {
+    printf '%s\n' 'Could not save the answer.' >&2
+    return 0
+  }
+  if ! "$JQ" \
+    --arg id "$WIDGET_ID" \
+    --arg boot "$current" \
+    --arg yes "$yes" \
+    '
+      def patch:
+        if .id == $id then
+          .offerSeen = true
+          | if $yes == "1" then .names = ((.names // {}) + {($boot): "Omarchy"}) else . end
+        else . end;
+      .bar.layout.left = ((.bar.layout.left // []) | map(patch))
+      | .bar.layout.center = ((.bar.layout.center // []) | map(patch))
+      | .bar.layout.right = ((.bar.layout.right // []) | map(patch))
+      | if (.plugins | type) == "array" then .plugins |= map(patch) else . end
+    ' "$file" >"$tmp"; then
+    rm -f -- "$tmp"
+    printf '%s\n' 'Could not save the answer.' >&2
+    return 0
+  fi
+  if ! "$JQ" -e --arg id "$WIDGET_ID" --arg boot "$current" --arg yes "$yes" '
+    [ .bar.layout.left[]?, .bar.layout.center[]?, .bar.layout.right[]?, .plugins[]? ]
+    | map(select(.id == $id)) | .[0] as $row
+    | $row.offerSeen == true and ($yes != "1" or $row.names[$boot] == "Omarchy")
+  ' "$tmp" >/dev/null; then
+    rm -f -- "$tmp"
+    printf '%s\n' 'Could not save the answer.' >&2
+    return 0
+  fi
+  /usr/bin/mv -f -T -- "$tmp" "$file"
+}
+
 cmd_list() {
   load_firmware || { printf '%s\n' "$PARSED"; exit 1; }
+  maybe_offer_omarchy || true
   printf '%s\n' "$PARSED"
 }
 

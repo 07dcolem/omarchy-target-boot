@@ -8,7 +8,7 @@ then reboots into that system for the next boot only.
 The popup uses the shell theme: popup surface, bar foreground, bar font, and
 the same hover and selected fills as the built-in panels.
 
-![The firmware menu, dropped from the bar](preview.png)
+![Reboot into](preview.jpg)
 
 ![The countdown after a system is chosen](screenshots/countdown.png)
 
@@ -46,6 +46,10 @@ omarchy plugin remove io.github.07dcolem.target-boot
 | Clear next boot | drops a next boot that is already armed |
 
 The ⋮ menu sits at the end of each row. **Rename** edits the name shown in this plugin. **Hide** takes that system off the list. **Hidden** at the bottom of the menu lists every hidden system, including one the firmware no longer has, and **Unhide** puts it back. Rename and hide are saved on the widget. The firmware menu stays as it is. An inactive system shows in the main list again when **Show inactive entries** is on.
+
+The first time the menu opens, and the first time `target-boot list` is run in a terminal, it asks whether the system you are in should be shown as **Omarchy**. Either answer is remembered on the widget. Esc closes the menu without answering, so the question comes back next time. A list captured by another program, including the panel's own refresh, is not a terminal and is never asked. Windows keeps its own glyph. An Omarchy name uses the square Omarchy mark, in the menu color, at the same size.
+
+Opening the menu puts a large circular restart arrow in the center and spins it. The arrow then settles faint behind the operating systems as they wipe in. A hovered or highlighted operating system gets one slanted shine. **Stay here** and **Go now** grow corner ticks and a star instead.
 
 Keyboard, while the menu is open:
 
@@ -188,6 +192,12 @@ omarchy plugin validate .
 ```
 
 ## Changelog
+
+### 1.3.0
+
+- The menu opens on a large spinning circular restart arrow. It then sits faint behind the operating systems.
+- The first time you open the menu, or run `target-boot list` in a terminal, you can name the current boot Omarchy. That row uses the square Omarchy mark. Windows keeps its own glyph.
+- Hovering an operating system runs a slanted shine. Stay here and Go now use corner ticks and a star.
 
 ### 1.2.1
 

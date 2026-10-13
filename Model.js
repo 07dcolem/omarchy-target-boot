@@ -73,13 +73,13 @@ function asList(raw) {
   return []
 }
 
-function iconFor(entry) {
-  var label = String(entry && entry.label || "")
+function iconFor(entry, names) {
   var file = String(entry && entry.file || "")
   var path = String(entry && entry.path || "")
-  var blob = (label + " " + file + " " + path).toLowerCase()
+  var blob = (displayLabel(entry, names || {}) + " " + firmwareLabel(entry) + " " + file + " " + path).toLowerCase()
   if (blob.indexOf("windows") !== -1 || blob.indexOf("microsoft") !== -1 || blob.indexOf("bootmgfw") !== -1)
     return "󰖳"
+  if (blob.indexOf("omarchy") !== -1) return omarchyIcon()
   return "󰋊"
 }
 
@@ -303,6 +303,51 @@ function parsePayload(raw) {
   }
 }
 
+function omarchyIcon() {
+  return "omarchy"
+}
+
+// The square Omarchy mark, taken from the green logo. 1 is ink.
+function omarchyMarkRows() {
+  return [
+    "111111111111111",
+    "100000010000001",
+    "101111100011101",
+    "101000000000101",
+    "101000000000101",
+    "101000000000101",
+    "101000000000101",
+    "111000000000101",
+    "101000000000101",
+    "101000000000101",
+    "101000000000101",
+    "101000000000101",
+    "101111111111101",
+    "100000010000001",
+    "111111101111111"
+  ]
+}
+
+function offerLine(label) {
+  var name = cleanName(label) || "this operating system"
+  return "This boot is " + name + ". Call it Omarchy in this menu?"
+}
+
+// The current boot, once, until the person answers or it is already Omarchy.
+function offerTarget(firmware, names, seen) {
+  if (seen === true) return null
+  var entries = firmware && Array.isArray(firmware.entries) ? firmware.entries : []
+  var current = null
+  for (var i = 0; i < entries.length; i++) {
+    if (entries[i] && entries[i].current === true) current = entries[i]
+  }
+  if (!current) return null
+  var id = normalizeId(current.id)
+  if (!id) return null
+  if (iconFor(current, names) === omarchyIcon()) return null
+  return { id: id, label: displayLabel(current, names) }
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     holdMs: holdMs,
@@ -322,6 +367,10 @@ if (typeof module !== "undefined") {
     withName: withName,
     withHidden: withHidden,
     iconFor: iconFor,
+    omarchyIcon: omarchyIcon,
+    omarchyMarkRows: omarchyMarkRows,
+    offerLine: offerLine,
+    offerTarget: offerTarget,
     visibleEntries: visibleEntries,
     hiddenEntries: hiddenEntries,
     entryById: entryById,
