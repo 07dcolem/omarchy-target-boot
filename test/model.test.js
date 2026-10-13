@@ -87,10 +87,12 @@ assert.strictEqual(Object.keys(Model.withName(many, "0040", "Extra")).length, 64
 assert.strictEqual(Model.withName(many, "0000", "Renamed")["0000"], "Renamed")
 assert.strictEqual(Model.withHidden(Object.keys(many), "0040", true).length, 64)
 
+assert.strictEqual(Model.departingLine(4, "Windows Boot Manager"), "Next boot will be Windows Boot Manager, just this once")
 assert.strictEqual(Model.departingLine(3, "Windows Boot Manager"), "Setting next boot to Windows Boot Manager")
 assert.strictEqual(Model.departingLine(2, "Windows Boot Manager"), "The saved boot order stays as it is")
 assert.strictEqual(Model.departingLine(1, "Windows Boot Manager"), "Rebooting into Windows Boot Manager")
 assert.strictEqual(Model.departingLine(0, "Windows Boot Manager"), "Rebooting into Windows Boot Manager")
+assert.strictEqual(Model.departingLine(4, "  "), "Next boot will be this operating system, just this once")
 assert.strictEqual(Model.departingLine(3, "  "), "Setting next boot to this operating system")
 
 let step = { countdown: Model.countdownStart(), commit: false }
@@ -99,9 +101,23 @@ while (!step.commit) {
   step = Model.stepCountdown(step.countdown)
   seen.push(step.countdown)
 }
-assert.deepStrictEqual(seen, [3, 2, 1, 0])
+assert.deepStrictEqual(seen, [4, 3, 2, 1, 0])
 assert.strictEqual(step.commit, true)
-assert.ok(Model.holdMs() >= 1000)
+assert.strictEqual(Model.countdownStart(), 4)
+assert.strictEqual(Model.holdMs(), 1500)
+assert.strictEqual(Model.flickMs(), 90)
+assert.strictEqual(Model.poofMs(), 400)
+assert.strictEqual(Model.poofText(), "˚ ✦ poof ✦ ˚")
+assert.deepStrictEqual(Model.rushPlan(4), [3, 2, 1])
+assert.deepStrictEqual(Model.rushPlan(2), [1])
+assert.deepStrictEqual(Model.rushPlan(1), [])
+assert.strictEqual(Model.moveDepartChoice(0, -1, 0), 0)
+assert.strictEqual(Model.moveDepartChoice(1, -1, 0), 0)
+assert.strictEqual(Model.moveDepartChoice(0, 1, 0), 1)
+assert.strictEqual(Model.moveDepartChoice(1, 0, -1), 0)
+assert.strictEqual(Model.moveDepartChoice(0, 0, 1), 1)
+assert.strictEqual(Model.moveDepartChoice(1, 0, 0), 1)
+assert.strictEqual(Model.moveDepartChoice(0, 0, 0), 0)
 assert.ok(Model.typeMs() > 0)
 
 const payload = Model.parsePayload('{"ok":true,"bootOrder":["0005"],"entries":[{"id":"0005"}]}')

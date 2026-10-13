@@ -41,7 +41,8 @@ omarchy plugin remove io.github.07dcolem.target-boot
 | Operating system row | starts the countdown for that system |
 | ⋮ on a row | Rename or Hide |
 | Hidden | lists the systems you hid, and shows one again |
-| Stay here | cancels the countdown |
+| Stay here | cancels the countdown. Esc always does this too |
+| Go now | skips the rest of the countdown. Shift+Enter does this too |
 | Clear next boot | drops a next boot that is already armed |
 
 The ⋮ menu sits at the end of each row. **Rename** edits the name shown in this plugin. **Hide** takes that system off the list. **Hidden** at the bottom of the menu lists every hidden system, including one the firmware no longer has, and **Unhide** puts it back. Rename and hide are saved on the widget. The firmware menu stays as it is. An inactive system shows in the main list again when **Show inactive entries** is on.
@@ -50,9 +51,10 @@ Keyboard, while the menu is open:
 
 | Key | Action |
 |---|---|
-| `j` `k` ↑ ↓ | move |
-| `h` `l` ← → | leave the ⋮ button, or move onto it |
-| `Enter` `Space` | start the countdown for the highlighted system |
+| `j` `k` ↑ ↓ | move. During the countdown, down and `j` highlight Go now, up and `k` highlight Stay here |
+| `h` `l` ← → | leave the ⋮ button, or move onto it. During the countdown, left highlights Stay here and right highlights Go now |
+| `Enter` `Space` | start the countdown, or run the highlighted Stay here / Go now button |
+| `Shift+Enter` | during the countdown, go now |
 | `.` | open Rename and Hide for the highlighted system |
 | `Esc` | close that menu, leave Hidden, cancel the countdown, or close the menu |
 | `r` | read the firmware again |
@@ -66,19 +68,33 @@ following boot is marked **Next boot**.
 ### The countdown
 
 Choosing a system does not reboot on the click. The menu crossfades into a
-hold of about four and a half seconds:
+hold of about six seconds:
 
-1. **3** — “Setting next boot to …” types out under the name.
-2. **2** — “The saved boot order stays as it is.”
-3. **1** — “Rebooting into …”
+1. **4** — “Next boot will be …, just this once.” types out under the name.
+2. **3** — “Setting next boot to …”
+3. **2** — “The saved boot order stays as it is.”
+4. **1** — “Rebooting into …”
 
-The numeral fades and settles on each step. Esc or **Stay here** returns to
-the list, and at that point the firmware has not been touched. When the hold
-ends, the restart glyph pulses, next boot is set, and Omarchy runs its own
-reboot (the “Rebooting” indicator, then windows close).
+The numeral fades and settles on each step. **Stay here** and **Go now** sit
+side by side, each half the row. The highlight starts on Stay here. Arrow
+keys move it from one button to the other, and Enter or Space runs the
+highlighted one. Esc always returns to the list. At that point the firmware
+has not been touched.
 
-Dismissing the menu during the hold cancels it. Once next boot has been
-written, the reboot continues.
+When the hold ends, the restart glyph pulses, next boot is set, and Omarchy
+runs its own reboot (the “Rebooting” indicator, then windows close).
+
+**Go now**, or Shift+Enter, runs the remaining numerals down in a blink, then
+a short text cloud, “˚ ✦ poof ✦ ˚”, blooms and fades where the numeral was.
+The reboot starts as that cloud disappears. A held key does not repeat that
+skip, or the cancel, so each press counts once. From the moment Go now is
+pressed, Stay here no longer cancels, and closing the menu does not either.
+The firmware is still untouched until the cloud finishes and next boot is written.
+On a machine without passwordless sudo, the polkit prompt appears after the
+cloud.
+
+Dismissing the menu during the hold cancels it, unless Go now was already
+pressed. Once next boot has been written, the reboot continues.
 
 ## What gets written
 
@@ -150,7 +166,7 @@ omarchy-shell io.github.07dcolem.target-boot rebootInto 0001
 ```
 
 `rebootInto` opens the menu and starts the same countdown. It does not skip
-the hold.
+the hold. Go now and Shift+Enter do that from the panel.
 
 ## How it works
 
@@ -172,6 +188,11 @@ omarchy plugin validate .
 ```
 
 ## Changelog
+
+### 1.2.0
+
+- The countdown is four beats, about six seconds. The new first line is “Next boot will be …, just this once.”
+- **Stay here** and **Go now** share one row. Arrow keys move the highlight between them, and Enter or Space runs the highlighted button. The highlight starts on Stay here. Go now ticks the remaining numerals down, plays a short “poof” cloud, and starts the reboot. Shift+Enter does the same from either button. Esc still cancels, until Go now has been pressed.
 
 ### 1.1.0
 

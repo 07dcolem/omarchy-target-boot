@@ -46,6 +46,11 @@ Panel {
   property bool suppressActivate: false
 
   property bool departing: false
+  property int departChoice: 0
+  property bool rushing: false
+  property bool poofing: false
+  property bool shiftHeld: false
+  property bool enterRepeat: false
   property bool busy: false
   property bool committed: false
   property string departingId: ""
@@ -53,6 +58,9 @@ Panel {
   property int countdown: Model.countdownStart()
   property int pendingCountdown: Model.countdownStart()
   property string shownLine: ""
+
+  readonly property int poofInMs: Math.round(Model.poofMs() * 0.35)
+  readonly property int poofOutMs: Model.poofMs() - poofInMs
 
   readonly property var visibleEntries: Model.visibleEntries(firmware, showInactive, hiddenIds)
   readonly property var hiddenEntries: Model.hiddenEntries(firmware, hiddenIds)
@@ -62,7 +70,7 @@ Panel {
     var entry = Model.entryById(firmware ? firmware.entries : [], bootNextId)
     return entry ? Model.displayLabel(entry, nameMap) : ""
   }
-  readonly property string statusLine: Model.departingLine(countdown, departingLabel)
+  readonly property string statusLine: Model.departingLine(rushing ? 1 : countdown, departingLabel)
   readonly property string caption: {
     if (showingHidden)
       return "These stay out of the list until you show them again."
@@ -126,7 +134,13 @@ Panel {
   }
 
   function moveCursor(dx, dy) {
-    if (departing || renamingId !== "") return
+    if (renamingId !== "") return
+    if (departing) {
+      if (busy || committed || rushing) return
+      cursorActive = true
+      departChoice = Model.moveDepartChoice(departChoice, dx, dy)
+      return
+    }
     cursorActive = true
     if (menuEntryId !== "") {
       if (dy > 0) menuAction = 1
@@ -152,7 +166,12 @@ Panel {
   }
 
   function activateCursor() {
-    if (departing || busy || committed || renamingId !== "" || suppressActivate) return
+    if (renamingId !== "" || suppressActivate) return
+    if (departing) {
+      if (!busy && !committed && !rushing) onCountdownEnter(false)
+      return
+    }
+    if (busy || committed) return
     if (menuEntryId !== "") {
       runMenuAction()
       return
@@ -181,7 +200,7 @@ Panel {
   }
 
   function beginDeparture(id) {
-    if (busy || committed) return
+    if (busy || committed || rushing) return
     var clean = Model.normalizeId(id)
     if (!clean) {
       errorText = "Boot id must be four hex digits"
@@ -194,11 +213,13 @@ Panel {
     }
     errorText = ""
     var already = departing
+    resetCountVisual()
     departingId = clean
     departingLabel = Model.displayLabel(entry, nameMap)
     countdown = Model.countdownStart()
     pendingCountdown = countdown
     shownLine = ""
+    departChoice = 0
     departing = true
     countdownTimer.restart()
     if (already) playArrive()
@@ -206,15 +227,19 @@ Panel {
   }
 
   function cancelDeparture() {
-    if (busy || committed) return
+    if (busy || committed || rushing) return
     countdownTimer.stop()
+    flickTimer.stop()
     countSwap.stop()
+    countPop.stop()
     arrive.stop()
+    poofAnim.stop()
+    resetCountVisual()
     departing = false
   }
 
   function advanceDeparture() {
-    if (!departing || busy || committed) return
+    if (!departing || busy || committed || rushing) return
     var step = Model.stepCountdown(countdown)
     if (step.commit) {
       commitReboot()
@@ -222,6 +247,66 @@ Panel {
     }
     pendingCountdown = step.countdown
     countSwap.restart()
+  }
+
+  // Enter or Space runs the highlighted button. Shift+Enter always skips.
+  // Accepting the key from both the shortcut override and the key catcher
+  // is safe: the second call sees rushing, or a countdown that is already gone.
+  function onCountdownEnter(shifted) {
+    if (enterRepeat) return
+    if (!departing || busy || committed || rushing || renameFieldActive) return
+    suppressActivate = true
+    if (shifted || departChoice === 1) skipDeparture()
+    else cancelDeparture()
+    Qt.callLater(function() { suppressActivate = false })
+  }
+
+  function skipDeparture() {
+    if (!departing || busy || committed || rushing || departingId === "") return
+    rushing = true
+    countdownTimer.stop()
+    countSwap.stop()
+    arrive.stop()
+    shownLine = Model.departingLine(1, departingLabel)
+    countLabel.y = 0
+    lineLabel.opacity = 1
+    nameLabel.opacity = 1
+    advanceFlick()
+  }
+
+  function advanceFlick() {
+    if (!rushing || busy || committed) return
+    var step = Model.stepCountdown(countdown)
+    if (step.commit) {
+      startPoof()
+      return
+    }
+    countdown = step.countdown
+    pendingCountdown = countdown
+    countPop.restart()
+    flickTimer.restart()
+  }
+
+  function startPoof() {
+    if (!rushing || busy || committed) return
+    flickTimer.stop()
+    countPop.stop()
+    poofing = true
+    poofAnim.restart()
+  }
+
+  function finishPoof() {
+    if (!poofing || !rushing) return
+    poofing = false
+    commitReboot()
+  }
+
+  function resetCountVisual() {
+    rushing = false
+    poofing = false
+    countLabel.opacity = 1
+    countLabel.scale = 1
+    countLabel.y = 0
   }
 
   function applyPendingStep() {
@@ -243,6 +328,7 @@ Panel {
       busy = false
       committed = false
       departing = false
+      resetCountVisual()
       errorText = parsed.error || "Could not set next boot"
       if (!opened) open()
       refresh()
@@ -392,7 +478,7 @@ Panel {
     syncCursor()
   }
 
-  onStatusLineChanged: if (departing) shownLine = ""
+  onStatusLineChanged: if (departing && !rushing) shownLine = ""
   onDepartingChanged: if (departing) playArrive()
   // Settings can change while the item is still being created. Defer the
   // cursor update so the name map and hidden list exist first.
@@ -432,15 +518,22 @@ Panel {
     id: countdownTimer
     interval: Model.holdMs()
     repeat: true
-    running: root.departing && !root.busy && !root.committed
+    running: root.departing && !root.busy && !root.committed && !root.rushing
     onTriggered: root.advanceDeparture()
+  }
+
+  Timer {
+    id: flickTimer
+    interval: Model.flickMs()
+    repeat: false
+    onTriggered: root.advanceFlick()
   }
 
   Timer {
     id: typeTimer
     interval: Model.typeMs()
     repeat: true
-    running: root.departing && root.shownLine.length < root.statusLine.length
+    running: root.departing && !root.rushing && root.shownLine.length < root.statusLine.length
     onTriggered: root.shownLine = root.statusLine.slice(0, root.shownLine.length + 1)
   }
 
@@ -451,6 +544,77 @@ Panel {
     NumberAnimation { target: countLabel; property: "y"; from: Style.space(6); to: 0; duration: 280; easing.type: Easing.OutCubic }
     NumberAnimation { target: lineLabel; property: "opacity"; from: 0; to: 1; duration: 320; easing.type: Easing.OutQuad }
     NumberAnimation { target: nameLabel; property: "opacity"; from: 0; to: 1; duration: 320; easing.type: Easing.OutQuad }
+  }
+
+  SequentialAnimation {
+    id: countPop
+    alwaysRunToEnd: false
+    ScriptAction {
+      script: {
+        countLabel.opacity = 0.35
+        countLabel.scale = 0.9
+      }
+    }
+    ParallelAnimation {
+      NumberAnimation {
+        target: countLabel
+        property: "opacity"
+        to: 1
+        duration: Model.flickMs()
+        easing.type: Easing.OutQuad
+      }
+      NumberAnimation {
+        target: countLabel
+        property: "scale"
+        to: 1
+        duration: Model.flickMs()
+        easing.type: Easing.OutCubic
+      }
+    }
+  }
+
+  SequentialAnimation {
+    id: poofAnim
+    alwaysRunToEnd: false
+    ScriptAction {
+      script: {
+        countLabel.opacity = 0
+        countLabel.scale = 0.62
+      }
+    }
+    ParallelAnimation {
+      NumberAnimation {
+        target: countLabel
+        property: "opacity"
+        to: 1
+        duration: root.poofInMs
+        easing.type: Easing.OutCubic
+      }
+      NumberAnimation {
+        target: countLabel
+        property: "scale"
+        to: 1.08
+        duration: root.poofInMs
+        easing.type: Easing.OutCubic
+      }
+    }
+    ParallelAnimation {
+      NumberAnimation {
+        target: countLabel
+        property: "opacity"
+        to: 0
+        duration: root.poofOutMs
+        easing.type: Easing.InQuad
+      }
+      NumberAnimation {
+        target: countLabel
+        property: "scale"
+        to: 1.34
+        duration: root.poofOutMs
+        easing.type: Easing.OutQuad
+      }
+    }
+    ScriptAction { script: root.finishPoof() }
   }
 
   SequentialAnimation {
@@ -531,12 +695,26 @@ Panel {
 
       onMoveRequested: function(dx, dy) { root.moveCursor(dx, dy) }
       onActivateRequested: root.activateCursor()
+      onReturnRequested: root.onCountdownEnter(root.shiftHeld)
       onCloseRequested: {
         if (root.renamingId !== "") root.cancelRename()
         else if (root.menuEntryId !== "") root.menuEntryId = ""
         else if (root.showingHidden) root.closeHidden()
         else if (root.departing && !root.busy && !root.committed) root.cancelDeparture()
         else root.close()
+      }
+      Keys.onShortcutOverride: function(event) {
+        var enter = event.key === Qt.Key_Return || event.key === Qt.Key_Enter
+        if (!enter) return
+        root.enterRepeat = event.isAutoRepeat === true
+        if (event.isAutoRepeat) {
+          if (root.departing && !root.renameFieldActive) event.accepted = true
+          return
+        }
+        root.shiftHeld = (event.modifiers & Qt.ShiftModifier) !== 0
+        if (!root.departing || root.busy || root.committed || root.rushing || root.renameFieldActive) return
+        event.accepted = true
+        root.onCountdownEnter(root.shiftHeld)
       }
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(text) {
@@ -695,16 +873,16 @@ Panel {
 
               Item {
                 width: parent.width
-                implicitHeight: Math.max(countLabel.implicitHeight, rebootMark.implicitHeight) + Style.space(4)
+                implicitHeight: Math.max(countLabel.implicitHeight, rebootMark.implicitHeight) + Style.space(root.poofing ? 12 : 4)
 
                 Text {
                   id: countLabel
                   visible: !root.busy && !root.committed
-                  text: String(root.countdown)
+                  text: root.poofing ? Model.poofText() : String(root.countdown)
                   textFormat: Text.PlainText
                   color: root.foreground
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.displayLarge
+                  font.pixelSize: root.poofing ? Style.font.display : Style.font.displayLarge
                   font.bold: true
                   transformOrigin: Item.Left
                   y: 0
@@ -754,16 +932,37 @@ Panel {
                 font.pixelSize: Style.font.body
               }
 
-              Button {
+              Row {
+                id: departActions
                 width: parent.width
-                visible: root.departing && !root.busy && !root.committed
-                text: "Stay here"
-                tooltipText: "Or press Esc"
-                bordered: true
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                fontSize: Style.font.body
-                onClicked: root.cancelDeparture()
+                spacing: Style.spacing.sm
+                visible: root.departing && !root.rushing && !root.busy && !root.committed
+
+                Button {
+                  width: (departActions.width - departActions.spacing) / 2
+                  text: "Stay here"
+                  tooltipText: "Enter when highlighted"
+                  bordered: true
+                  hasCursor: root.departChoice === 0
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.body
+                  onClicked: root.cancelDeparture()
+                  onHovered: function(isHovered) { if (isHovered) root.departChoice = 0 }
+                }
+
+                Button {
+                  width: (departActions.width - departActions.spacing) / 2
+                  text: "Go now"
+                  tooltipText: "Or press Shift+Enter"
+                  bordered: true
+                  hasCursor: root.departChoice === 1
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.body
+                  onClicked: root.skipDeparture()
+                  onHovered: function(isHovered) { if (isHovered) root.departChoice = 1 }
+                }
               }
             }
           }

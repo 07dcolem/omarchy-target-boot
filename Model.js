@@ -9,8 +9,20 @@ function typeMs() {
   return 16
 }
 
+function flickMs() {
+  return 90
+}
+
+function poofMs() {
+  return 400
+}
+
 function countdownStart() {
-  return 3
+  return 4
+}
+
+function poofText() {
+  return "˚ ✦ poof ✦ ˚"
 }
 
 function normalizeId(id) {
@@ -231,23 +243,48 @@ function rowDetail(entry, names) {
   return bits.join("  ·  ")
 }
 
-// Three beats, one per second-and-a-half of the hold. The last beat stays
+// Four beats, one per second-and-a-half of the hold. The last beat stays
 // on screen while the reboot itself starts.
 function departingLine(countdown, label) {
   var name = String(label || "").replace(/^\s+|\s+$/g, "")
   if (!name) name = "this operating system"
   var step = Number(countdown)
-  if (step >= 3) return "Setting next boot to " + name
+  if (step >= 4) return "Next boot will be " + name + ", just this once"
+  if (step === 3) return "Setting next boot to " + name
   if (step === 2) return "The saved boot order stays as it is"
   return "Rebooting into " + name
 }
 
-// 3 → 2 → 1, and the step away from 1 is the commit. The hold between
+// 4 → 3 → 2 → 1, and the step away from 1 is the commit. The hold between
 // steps is what the panel waits before it writes BootNext.
 function stepCountdown(countdown) {
   var current = Number(countdown)
   if (!(current >= 2)) return { countdown: 0, commit: true }
   return { countdown: current - 1, commit: false }
+}
+
+// 0 is Stay here, 1 is Go now. Left and up select Stay. Right and down select Go.
+// A negative axis wins when both are set. Zero movement leaves the choice.
+function moveDepartChoice(choice, dx, dy) {
+  if (Number(dx) < 0 || Number(dy) < 0) return 0
+  if (Number(dx) > 0 || Number(dy) > 0) return 1
+  return Number(choice) === 1 ? 1 : 0
+}
+
+// Numerals Go now still shows, one flick each, before the poof. The beat
+// already on screen is not repeated. An empty list means poof immediately.
+function rushPlan(countdown) {
+  var shown = []
+  var current = Number(countdown)
+  var guard = 0
+  while (guard < 8) {
+    guard++
+    var step = stepCountdown(current)
+    if (step.commit) return shown
+    shown.push(step.countdown)
+    current = step.countdown
+  }
+  return shown
 }
 
 function parsePayload(raw) {
@@ -270,7 +307,10 @@ if (typeof module !== "undefined") {
   module.exports = {
     holdMs: holdMs,
     typeMs: typeMs,
+    flickMs: flickMs,
+    poofMs: poofMs,
     countdownStart: countdownStart,
+    poofText: poofText,
     normalizeId: normalizeId,
     plain: plain,
     cleanName: cleanName,
@@ -290,6 +330,8 @@ if (typeof module !== "undefined") {
     rowDetail: rowDetail,
     departingLine: departingLine,
     stepCountdown: stepCountdown,
+    moveDepartChoice: moveDepartChoice,
+    rushPlan: rushPlan,
     parsePayload: parsePayload
   }
 }
