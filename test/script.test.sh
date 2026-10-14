@@ -105,44 +105,24 @@ if grep -n -E 'command -v .*(efibootmgr|sudo|pkexec|jq|systemctl|omarchy-system-
   exit 1
 fi
 
-# Rename must not construct a native line editor for every firmware row.
-# Qt 6.12 reads the clipboard body from each of those, even while hidden.
-if grep -n -E 'TextField[[:space:]]*\{' "$root/Panel.qml"; then
-  echo "rename still constructs a TextField" >&2
-  exit 1
-fi
+# Rename builds one line editor, and only while that row is being renamed.
 grep -q 'active: root.opened && row.renaming' "$root/Panel.qml"
-grep -q 'Controls.TextArea' "$root/Panel.qml"
-grep -q 'ContextMenu.menu: null' "$root/Panel.qml"
-grep -q '/usr/bin/wl-paste' "$root/bin/read-clipboard"
-grep -q '/usr/bin/timeout -k 1 -- 1' "$root/bin/read-clipboard"
-if grep -n -E 'shell=True|StdioCollector|bash -c' "$root/bin/read-clipboard"; then
-  echo "clipboard helper collects or shells out unsafely" >&2
+grep -q 'PlainLine {' "$root/Panel.qml"
+grep -q 'maximumLength: 80' "$root/Panel.qml"
+node "$root/test/plain-edit.test.js"
+helper="$root/bin/read-$(printf '%s%s' clip board)"
+if [[ -e $helper ]]; then
+  echo "rename still ships a read helper" >&2
   exit 1
 fi
-
-# The helper caps the producer. A long offer becomes 32 bytes, not 32 bytes
-# after the rest has already been stored. A stalled producer is killed.
-(
-  # shellcheck disable=SC1091
-  source "$root/bin/read-clipboard"
-  payload=$(/usr/bin/printf 'A%.0s' $(seq 1 32))$(/usr/bin/printf 'B%.0s' $(seq 1 200))
-  got=$(read_capped 32 /usr/bin/printf '%s' "$payload")
-  [ "$got" = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" ]
-  [ "$(printf '%s' "$got" | wc -c)" -eq 32 ]
-
-  start=$(date +%s)
-  stalled=$(read_capped 32 /usr/bin/timeout -k 1 -- 1 /usr/bin/sleep 30)
-  elapsed=$(( $(date +%s) - start ))
-  [ -z "$stalled" ]
-  [ "$elapsed" -le 3 ]
-)
-
-set +e
-"$root/bin/read-clipboard" nope >/dev/null
-paste_status=$?
-set -e
-[ "$paste_status" -eq 2 ]
+deny=$(printf '%s%s|%s%s|%s%s|%s%s|%s%s|%s%s' \
+  Text Field Text Area Text Input Text Edit Clip board pa ste)
+if grep -RInE "$deny" "$root" \
+  --include='*.qml' --include='*.js' --include='*.md' --include='*.json' --include='*.sh' \
+  --exclude-dir='.git'; then
+  echo "native line editor wording remains" >&2
+  exit 1
+fi
 
 grep -q 'component RestartArrow' "$root/Panel.qml"
 grep -q 'bootAnim.restart' "$root/Panel.qml"

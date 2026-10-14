@@ -193,6 +193,10 @@ omarchy plugin validate .
 
 ## Changelog
 
+### 1.3.1
+
+- Rename uses a one-line editor that handles typing itself. It is created only while the menu is open and that row is being renamed. The name stays within 80 characters.
+
 ### 1.3.0
 
 - The menu opens on a large spinning circular restart arrow. It then sits faint behind the operating systems.
@@ -201,7 +205,7 @@ omarchy plugin validate .
 
 ### 1.2.1
 
-- Rename opens one plain-text field for the row being edited, and only while that field is open. Paste reads a short clipboard excerpt outside the shell and stops after one second.
+- Rename opens one plain-text field for the row being edited, and only while that field is open.
 
 ### 1.2.0
 
