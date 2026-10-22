@@ -109,6 +109,14 @@ fi
 grep -q 'active: root.opened && row.renaming' "$root/Panel.qml"
 grep -q 'PlainLine {' "$root/Panel.qml"
 grep -q 'maximumLength: 80' "$root/Panel.qml"
+# ScrollBar is not in scope unless Controls is imported. The alias keeps
+# qs.Ui.Button as Button. A bare ScrollBar { fails the panel on Edge.
+grep -q 'import QtQuick.Controls as Controls' "$root/Panel.qml"
+grep -q 'Controls.ScrollBar.vertical: Controls.ScrollBar { policy: Controls.ScrollBar.AsNeeded }' "$root/Panel.qml"
+if grep -nE '(^|[^[:alnum:]_.])ScrollBar[[:space:]]*\{' "$root/Panel.qml"; then
+  echo "unqualified ScrollBar remains" >&2
+  exit 1
+fi
 node "$root/test/plain-edit.test.js"
 helper="$root/bin/read-$(printf '%s%s' clip board)"
 if [[ -e $helper ]]; then

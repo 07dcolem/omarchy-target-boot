@@ -1,4 +1,6 @@
 import QtQuick
+// ScrollBar is a Controls type. The alias keeps qs.Ui.Button as Button.
+import QtQuick.Controls as Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -868,7 +870,7 @@ Panel {
         boundsBehavior: Flickable.StopAtBounds
         flickableDirection: Flickable.VerticalFlick
         interactive: contentHeight > height
-        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+        Controls.ScrollBar.vertical: Controls.ScrollBar { policy: Controls.ScrollBar.AsNeeded }
 
         Column {
           id: column

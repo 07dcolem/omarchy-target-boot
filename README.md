@@ -193,6 +193,10 @@ omarchy plugin validate .
 
 ## Changelog
 
+### 1.3.2
+
+- The menu loads on a shell that does not already provide a scrollbar type. The list scrollbar comes from Qt Quick Controls.
+
 ### 1.3.1
 
 - Rename uses a one-line editor that handles typing itself. It is created only while the menu is open and that row is being renamed. The name stays within 80 characters.
