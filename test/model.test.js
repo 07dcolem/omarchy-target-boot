@@ -22,6 +22,7 @@ assert.strictEqual(Model.normalizeId("0001;reboot"), "")
 assert.strictEqual(Model.normalizeId("next"), "")
 
 assert.strictEqual(Model.plain("Windows <img>"), "Windows img")
+assert.strictEqual(Model.plain("A & B <x>"), "A  B x")
 
 assert.strictEqual(Model.iconFor(entry({ label: "Windows Boot Manager" })), "󰖳")
 assert.strictEqual(Model.iconFor(entry({ file: "\\EFI\\MICROSOFT\\BOOT\\BOOTMGFW.EFI", label: "OS" })), "󰖳")
@@ -82,6 +83,7 @@ assert.strictEqual(
 )
 
 assert.strictEqual(Model.cleanName("  Work\n<box>  "), "Workbox")
+assert.strictEqual(Model.cleanName("A & B"), "A  B")
 assert.strictEqual(Model.cleanName("x".repeat(90)).length, 80)
 assert.strictEqual(Model.displayLabel(entry({ id: "0001", label: "Windows Boot Manager" }), { "0001": "Work" }), "Work")
 assert.strictEqual(Model.displayLabel(entry({ id: "0001", label: "Windows Boot Manager" }), {}), "Windows Boot Manager")
@@ -144,5 +146,78 @@ assert.strictEqual(payload.entries[0].id, "0005")
 assert.strictEqual(Model.parsePayload('{"ok":false,"error":"nope"}').error, "nope")
 assert.strictEqual(Model.parsePayload("").ok, false)
 assert.strictEqual(Model.parsePayload("{").ok, false)
+
+assert.strictEqual(Model.offerTarget({
+  entries: [entry({ id: "0005", label: "Limine", current: true, removable: true })]
+}, {}, false), null)
+assert.strictEqual(Model.offerTarget({
+  entries: [entry({ id: "0005", label: "Reboot into USB", current: true, owned: true })]
+}, {}, false), null)
+
+const ownedFirmware = {
+  entries: [
+    entry({ id: "0005", label: "Limine", current: true, owned: false, inOrder: true }),
+    entry({ id: "0008", label: "Reboot into USB", owned: true, inOrder: false }),
+    entry({ id: "0009", label: "Reboot into USB", owned: true, inOrder: true })
+  ]
+}
+assert.deepStrictEqual(Model.visibleEntries(ownedFirmware, true).map((item) => item.id), ["0005"])
+
+const rawUsb = []
+for (let n = 0; n < 9; n++) {
+  rawUsb.push({
+    key: "STICK" + n + "-1",
+    label: n === 0 ? "  DVD_ROM<img>  " : "Drive " + n,
+    size: n === 0 ? "28.7G" : "1G",
+    loaderName: "BOOTX64.EFI",
+    disk: "/dev/sda",
+    serial: "SECRET",
+    existingId: n === 1 ? "0006" : "",
+    next: false
+  })
+}
+rawUsb.push({ key: "../sda", label: "Bad", size: "1G", loaderName: "BOOTX64.EFI" })
+rawUsb.push({ key: "OTHER-1", label: "Windows", size: "1G", loaderName: "bootmgfw.efi" })
+const usb = Model.sanitizeUsb(rawUsb)
+assert.strictEqual(usb.length, 8)
+assert.strictEqual(usb[0].label, "DVD_ROMimg")
+assert.strictEqual(usb[0].size, "28.7G")
+assert.strictEqual(usb[0].disk, undefined)
+assert.strictEqual(usb[0].serial, undefined)
+assert.strictEqual(usb[1].existingId, "0006")
+assert.ok(!usb.some((item) => item.key === "../sda" || item.key === "OTHER-1"))
+
+const oneStick = {
+  bootNext: "0008",
+  entries: [entry({ id: "0008", label: "Reboot into USB", owned: true, next: true })],
+  usb: [{ key: "ABCD1234-1", label: "DVD_ROM", size: "28.7G", loaderName: "BOOTX64.EFI", existingId: "", next: false }]
+}
+assert.strictEqual(Model.nextBootLabel(oneStick, {}), "DVD_ROM")
+assert.strictEqual(Model.presentUsb(oneStick, false)[0].next, true)
+assert.deepStrictEqual(Model.presentUsb(oneStick, true), [])
+assert.strictEqual(Model.usbDetail(Model.presentUsb(oneStick, false)[0]), "Next boot  ·  28.7G  ·  BOOTX64.EFI")
+
+const twoSticks = {
+  bootNext: "0008",
+  entries: [entry({ id: "0008", label: "Reboot into USB", owned: true, next: true })],
+  usb: [
+    { key: "AAAA-1", label: "One", size: "1G", loaderName: "BOOTX64.EFI" },
+    { key: "BBBB-1", label: "Two", size: "2G", loaderName: "BOOTIA32.EFI" }
+  ]
+}
+assert.strictEqual(Model.nextBootLabel(twoSticks, {}), "USB drive")
+assert.strictEqual(Model.nextBootLabel({
+  bootNext: "0001",
+  entries: [entry({ id: "0001", label: "Windows Boot Manager", next: true })],
+  usb: []
+}, { "0001": "Windows" }), "Windows")
+
+const matched = {
+  bootNext: "0006",
+  entries: [entry({ id: "0006", label: "UEFI OS", next: true })],
+  usb: [{ key: "ABCD1234-1", label: "DVD_ROM", size: "28.7G", loaderName: "BOOTX64.EFI", existingId: "0006", next: true }]
+}
+assert.strictEqual(Model.nextBootLabel(matched, {}), "DVD_ROM")
+assert.strictEqual(Model.usbIcon(), "󰕓")
 
 console.log("model.test.js ok")

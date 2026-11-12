@@ -35,6 +35,35 @@ Panel {
   property var firmware: ({ ok: false, entries: [], bootCurrent: null, bootNext: null, bootOrder: [] })
   property string payloadText: ""
   property string errorText: ""
+  // The helper caps its own output. This ceiling is the shell-side stop,
+  // measured in UTF-16 units, so a runaway child cannot fill the process.
+  readonly property int outputCap: 262144
+  property string listBuf: ""
+  property string actionBuf: ""
+  property string clearBuf: ""
+  property int listUsed: 0
+  property int actionUsed: 0
+  property int clearUsed: 0
+  property bool listOverflow: false
+  property bool actionOverflow: false
+  property bool clearOverflow: false
+  // null copies that variable from the session when it is set. PATH is fixed
+  // so a caller cannot put another directory in front of the helper.
+  readonly property var sessionEnvironment: ({
+    PATH: "/usr/bin:/bin",
+    HOME: null,
+    USER: null,
+    LOGNAME: null,
+    XDG_RUNTIME_DIR: null,
+    XDG_CONFIG_HOME: null,
+    DBUS_SESSION_BUS_ADDRESS: null,
+    WAYLAND_DISPLAY: null,
+    DISPLAY: null,
+    XAUTHORITY: null,
+    LANG: null,
+    LC_ALL: null
+  })
+  property bool holdError: false
   property bool cursorActive: false
   property int selectedIndex: 0
   property bool cursorReady: false
@@ -85,6 +114,7 @@ Panel {
   property bool busy: false
   property bool committed: false
   property string departingId: ""
+  property bool departingUsb: false
   property string departingLabel: ""
   property int countdown: Model.countdownStart()
   property int pendingCountdown: Model.countdownStart()
@@ -96,17 +126,17 @@ Panel {
   readonly property var visibleEntries: Model.visibleEntries(firmware, showInactive, hiddenIds)
   readonly property var hiddenEntries: Model.hiddenEntries(firmware, hiddenIds)
   readonly property var listedEntries: showingHidden ? hiddenEntries : visibleEntries
+  readonly property var usbEntries: Model.presentUsb(firmware, showingHidden)
   readonly property string bootNextId: firmware && firmware.bootNext ? String(firmware.bootNext) : ""
-  readonly property string bootNextLabel: {
-    var entry = Model.entryById(firmware ? firmware.entries : [], bootNextId)
-    return entry ? Model.displayLabel(entry, nameMap) : ""
-  }
+  readonly property string bootNextLabel: Model.nextBootLabel(firmware, nameMap)
   readonly property string statusLine: Model.departingLine(rushing ? 1 : countdown, departingLabel)
   readonly property string caption: {
     if (showingHidden)
       return "These stay out of the list until you show them again."
     if (bootNextLabel !== "")
       return "Next boot is " + bootNextLabel + ". Pick another operating system to replace it."
+    if (usbEntries && usbEntries.length > 0)
+      return "Pick an operating system or a USB drive. It counts down, sets next boot, and reboots."
     return "Pick an operating system. It counts down, sets next boot, and reboots."
   }
   readonly property string emptyText: {
@@ -127,17 +157,43 @@ Panel {
     listProc.running = true
   }
 
+  function osCount() {
+    var rows = listedEntries
+    return rows && rows.length > 0 ? rows.length : 0
+  }
+
+  function usbCount() {
+    if (showingHidden) return 0
+    var rows = usbEntries
+    return rows && rows.length > 0 ? rows.length : 0
+  }
+
   function cursorCount() {
     var hiddenCount = hiddenIds && hiddenIds.length > 0 ? hiddenIds.length : 0
-    var rowCount = listedEntries && listedEntries.length > 0 ? listedEntries.length : 0
     var extra = !showingHidden && hiddenCount > 0 ? 1 : 0
-    return rowCount + extra
+    return osCount() + usbCount() + extra
+  }
+
+  function onUsbRow() {
+    return !showingHidden && selectedIndex >= osCount() && selectedIndex < osCount() + usbCount()
+  }
+
+  function usbAtCursor() {
+    if (!onUsbRow()) return null
+    var rows = usbEntries
+    return rows ? rows[selectedIndex - osCount()] : null
+  }
+
+  function rowIsRemovable(index) {
+    var rows = listedEntries
+    if (!rows || index < 0 || index >= rows.length) return false
+    var entry = rows[index]
+    return !!(entry && (entry.removable === true || entry.owned === true))
   }
 
   function onHiddenButton() {
     var hiddenCount = hiddenIds && hiddenIds.length > 0 ? hiddenIds.length : 0
-    var rowCount = visibleEntries && visibleEntries.length > 0 ? visibleEntries.length : 0
-    return !showingHidden && hiddenCount > 0 && selectedIndex === rowCount
+    return !showingHidden && hiddenCount > 0 && selectedIndex === osCount() + usbCount()
   }
 
   function syncCursor() {
@@ -188,7 +244,7 @@ Panel {
       return
     }
     if (dx > 0) {
-      if (!onHiddenButton()) actionFocused = true
+      if (!onHiddenButton() && !onUsbRow() && !rowIsRemovable(selectedIndex)) actionFocused = true
       return
     }
     if (dx < 0) {
@@ -221,10 +277,15 @@ Panel {
       openHidden()
       return
     }
+    if (onUsbRow()) {
+      var stick = usbAtCursor()
+      if (stick) beginUsbDeparture(stick.key)
+      return
+    }
     var rows = listedEntries
     if (selectedIndex < 0 || selectedIndex >= rows.length) return
     if (actionFocused) {
-      toggleRowMenu(rows[selectedIndex].id)
+      if (!rowIsRemovable(selectedIndex)) toggleRowMenu(rows[selectedIndex].id)
       return
     }
     if (showingHidden) unhideEntry(rows[selectedIndex].id)
@@ -238,6 +299,36 @@ Panel {
     lineLabel.opacity = 0
     nameLabel.opacity = 0
     arrive.restart()
+  }
+
+  function beginUsbDeparture(key) {
+    if (offering || busy || committed || rushing) return
+    var rows = usbEntries
+    var found = null
+    var text = String(key || "")
+    if (rows) {
+      for (var i = 0; i < rows.length; i++) {
+        if (rows[i] && rows[i].key === text) found = rows[i]
+      }
+    }
+    if (!found) {
+      errorText = "That USB drive is not available"
+      return
+    }
+    errorText = ""
+    var already = departing
+    resetCountVisual()
+    departingUsb = true
+    departingId = found.key
+    departingLabel = found.label
+    countdown = Model.countdownStart()
+    pendingCountdown = countdown
+    shownLine = ""
+    departChoice = 0
+    departing = true
+    countdownTimer.restart()
+    if (already) playArrive()
+    if (!opened) open()
   }
 
   function beginDeparture(id) {
@@ -255,6 +346,7 @@ Panel {
     errorText = ""
     var already = departing
     resetCountVisual()
+    departingUsb = false
     departingId = clean
     departingLabel = Model.displayLabel(entry, nameMap)
     countdown = Model.countdownStart()
@@ -277,6 +369,7 @@ Panel {
     poofAnim.stop()
     resetCountVisual()
     departing = false
+    departingUsb = false
   }
 
   function advanceDeparture() {
@@ -359,7 +452,9 @@ Panel {
     countdownTimer.stop()
     busy = true
     actionProc.running = false
-    actionProc.command = [cli, "reboot-into", departingId]
+    actionProc.command = departingUsb
+      ? [cli, "reboot-into-usb", departingId]
+      : [cli, "reboot-into", departingId]
     actionProc.running = true
   }
 
@@ -370,6 +465,7 @@ Panel {
       committed = false
       departing = false
       resetCountVisual()
+      holdError = true
       errorText = parsed.error || "Could not set next boot"
       if (!opened) open()
       refresh()
@@ -433,7 +529,14 @@ Panel {
   }
 
   function toggleRowMenu(id) {
+    var rows = listedEntries
     var clean = Model.normalizeId(id)
+    if (rows) {
+      for (var i = 0; i < rows.length; i++) {
+        if (rows[i] && Model.normalizeId(rows[i].id) === clean && (rows[i].removable === true || rows[i].owned === true))
+          return
+      }
+    }
     if (!clean || departing || renamingId !== "") return
     if (menuEntryId === clean) {
       menuEntryId = ""
@@ -549,10 +652,13 @@ Panel {
   function applyList(code, stdout) {
     var parsed = Model.parsePayload(stdout)
     if (code !== 0 || !parsed.ok || !Array.isArray(parsed.bootOrder)) {
+      holdError = false
       errorText = parsed.error || "Could not read the EFI boot entries"
       return
     }
-    if (errorText !== "" && !departing) errorText = ""
+    // A failed reboot refreshes the list. That read must not wipe the reason.
+    if (holdError) holdError = false
+    else if (errorText !== "" && !departing) errorText = ""
     firmware = parsed
     payloadText = stdout
     syncCursor()
@@ -583,6 +689,11 @@ Panel {
     if (!committed) cancelDeparture()
   }
   Component.onCompleted: refresh()
+  Component.onDestruction: {
+    if (listProc.running) listProc.signal(15)
+    if (actionProc.running) actionProc.signal(15)
+    if (clearProc.running) clearProc.signal(15)
+  }
 
   IpcHandler {
     target: root.ipcTarget
@@ -742,30 +853,84 @@ Panel {
     }
   }
 
+  function noteStream(which, data, keep) {
+    var text = String(data || "")
+    var overflow = which === "action" ? actionOverflow : which === "clear" ? clearOverflow : listOverflow
+    if (overflow) return
+    var buf = which === "action" ? actionBuf : which === "clear" ? clearBuf : listBuf
+    var used = which === "action" ? actionUsed : which === "clear" ? clearUsed : listUsed
+    if (used + text.length > outputCap) {
+      if (which === "action") { actionOverflow = true; actionBuf = ""; actionUsed = 0 }
+      else if (which === "clear") { clearOverflow = true; clearBuf = ""; clearUsed = 0 }
+      else { listOverflow = true; listBuf = ""; listUsed = 0 }
+      var proc = which === "action" ? actionProc : which === "clear" ? clearProc : listProc
+      if (proc.running) proc.signal(15)
+      var timer = which === "action" ? actionKill : which === "clear" ? clearKill : listKill
+      timer.restart()
+      return
+    }
+    if (which === "action") actionUsed = used + text.length
+    else if (which === "clear") clearUsed = used + text.length
+    else listUsed = used + text.length
+    if (!keep) return
+    if (which === "action") actionBuf = buf + text
+    else if (which === "clear") clearBuf = buf + text
+    else listBuf = buf + text
+  }
+
+  function takeStream(which) {
+    var overflow = which === "action" ? actionOverflow : which === "clear" ? clearOverflow : listOverflow
+    var text = which === "action" ? actionBuf : which === "clear" ? clearBuf : listBuf
+    if (which === "action") { actionBuf = ""; actionUsed = 0; actionOverflow = false; actionKill.stop() }
+    else if (which === "clear") { clearBuf = ""; clearUsed = 0; clearOverflow = false; clearKill.stop() }
+    else { listBuf = ""; listUsed = 0; listOverflow = false; listKill.stop() }
+    return overflow ? "" : text
+  }
+
+  Timer { id: listKill; interval: 2000; repeat: false; onTriggered: if (listProc.running) listProc.signal(9) }
+  Timer { id: actionKill; interval: 2000; repeat: false; onTriggered: if (actionProc.running) actionProc.signal(9) }
+  Timer { id: clearKill; interval: 2000; repeat: false; onTriggered: if (clearProc.running) clearProc.signal(9) }
+
   Process {
     id: listProc
-    stdout: StdioCollector { id: listOut; waitForEnd: true }
+    clearEnvironment: true
+    environment: root.sessionEnvironment
+    stdout: SplitParser { splitMarker: ""; onRead: function(data) { root.noteStream("list", data, true) } }
+    stderr: SplitParser { splitMarker: ""; onRead: function(data) { root.noteStream("list", data, false) } }
     onExited: function(code) {
-      Qt.callLater(function() { root.applyList(code, listOut.text) })
+      var overflow = root.listOverflow
+      var text = root.takeStream("list")
+      Qt.callLater(function() { root.applyList(overflow ? 1 : code, text) })
     }
   }
 
+  // No startup deadline. The polkit prompt waits until the person answers.
   Process {
     id: actionProc
-    stdout: StdioCollector { id: actionOut; waitForEnd: true }
+    clearEnvironment: true
+    environment: root.sessionEnvironment
+    stdout: SplitParser { splitMarker: ""; onRead: function(data) { root.noteStream("action", data, true) } }
+    stderr: SplitParser { splitMarker: ""; onRead: function(data) { root.noteStream("action", data, false) } }
     onExited: function(code) {
-      Qt.callLater(function() { root.finishAction(code, actionOut.text) })
+      var overflow = root.actionOverflow
+      var text = root.takeStream("action")
+      Qt.callLater(function() { root.finishAction(overflow ? 1 : code, text) })
     }
   }
 
   Process {
     id: clearProc
-    stdout: StdioCollector { id: clearOut; waitForEnd: true }
+    clearEnvironment: true
+    environment: root.sessionEnvironment
+    stdout: SplitParser { splitMarker: ""; onRead: function(data) { root.noteStream("clear", data, true) } }
+    stderr: SplitParser { splitMarker: ""; onRead: function(data) { root.noteStream("clear", data, false) } }
     onExited: function(code) {
+      var overflow = root.clearOverflow
+      var text = root.takeStream("clear")
       Qt.callLater(function() {
         root.busy = false
-        var parsed = Model.parsePayload(clearOut.text)
-        if (code !== 0 || !parsed.ok) {
+        var parsed = Model.parsePayload(text)
+        if (overflow || code !== 0 || !parsed.ok) {
           root.errorText = parsed.error || "Could not clear next boot"
           return
         }
@@ -831,7 +996,7 @@ Panel {
       onTextKey: function(text) {
         if (root.offering || root.renamingId !== "" || root.departing) return
         if (text === "r") root.refresh()
-        else if (text === "." && !root.onHiddenButton()) {
+        else if (text === "." && !root.onHiddenButton() && !root.onUsbRow() && !root.rowIsRemovable(root.selectedIndex)) {
           var rows = root.listedEntries
           if (root.selectedIndex >= 0 && root.selectedIndex < rows.length)
             root.toggleRowMenu(rows[root.selectedIndex].id)
@@ -1089,6 +1254,25 @@ Panel {
                 }
               }
 
+              PanelSectionHeader {
+                text: "USB"
+                visible: root.usbEntries && root.usbEntries.length > 0
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Repeater {
+                model: root.usbEntries
+
+                UsbRow {
+                  required property var modelData
+                  required property int index
+                  width: listBlock.width
+                  entry: modelData
+                  rowIndex: root.osCount() + index
+                }
+              }
+
               Button {
                 width: parent.width
                 visible: !root.showingHidden && root.hiddenIds && root.hiddenIds.length > 0
@@ -1103,7 +1287,7 @@ Panel {
                 onHovered: function(isHovered) {
                   if (!isHovered || root.departing) return
                   root.cursorActive = true
-                  root.selectedIndex = root.visibleEntries ? root.visibleEntries.length : 0
+                  root.selectedIndex = root.osCount() + root.usbCount()
                   root.actionFocused = false
                   root.menuEntryId = ""
                 }
@@ -1408,6 +1592,7 @@ Panel {
     readonly property bool menuOpen: root.menuEntryId === entryId && root.renamingId === ""
     readonly property bool renaming: root.renamingId === entryId
     readonly property bool omarchy: Model.iconFor(entry, root.nameMap) === Model.omarchyIcon()
+    readonly property bool noMenu: !!(entry && (entry.removable === true || entry.owned === true))
 
     hasCursor: rowSelected
     onRowSelectedChanged: if (rowSelected && !renaming) shineSweep.restart()
@@ -1567,6 +1752,7 @@ Panel {
           id: moreBtn
           anchors.right: parent.right
           anchors.verticalCenter: parent.verticalCenter
+          visible: !row.noMenu
           iconText: "⋮"
           tooltipText: root.showingHidden ? "Rename or unhide" : "Rename or hide"
           foreground: root.foreground
@@ -1647,6 +1833,134 @@ Panel {
         property: "x"
         from: -beam.width
         to: row.width
+        duration: 520
+        easing.type: Easing.OutCubic
+      }
+    }
+  }
+
+  component UsbRow: CursorSurface {
+    id: stick
+
+    property var entry: null
+    property int rowIndex: 0
+
+    readonly property string stickKey: entry && entry.key ? String(entry.key) : ""
+    readonly property string shownLabel: entry && entry.label ? String(entry.label) : "USB drive"
+    readonly property bool rowSelected: root.cursorActive && root.selectedIndex === rowIndex && !root.departing
+
+    hasCursor: rowSelected
+    onRowSelectedChanged: if (rowSelected) shineSweep.restart()
+    foreground: root.foreground
+    fill: root.hoverFill
+    currentFill: root.selectedFill
+    implicitHeight: rowBody.implicitHeight + Style.spacing.xl
+
+    MouseArea {
+      id: rowMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onContainsMouseChanged: if (containsMouse && !root.departing) {
+        root.cursorActive = true
+        if (root.selectedIndex !== stick.rowIndex) {
+          root.selectedIndex = stick.rowIndex
+          root.actionFocused = false
+          if (root.menuEntryId !== "") root.menuEntryId = ""
+        }
+      }
+      onClicked: {
+        if (root.departing || root.renamingId !== "" || root.suppressActivate) return
+        root.actionFocused = false
+        root.beginUsbDeparture(stick.stickKey)
+      }
+    }
+
+    PanelToolTip {
+      visible: rowMouse.containsMouse && !root.departing
+      text: "Reboot into " + Model.plain(stick.shownLabel)
+      fontFamily: root.fontFamily
+    }
+
+    Column {
+      id: rowBody
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.spacing.rowPaddingX
+      anchors.rightMargin: Style.spacing.rowPaddingX
+      spacing: Style.spacing.xs
+
+      Item {
+        id: mainLine
+        width: parent.width
+        implicitHeight: Math.max(usbGlyph.implicitHeight, info.implicitHeight)
+
+        Text {
+          id: usbGlyph
+          anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
+          text: Model.usbIcon()
+          textFormat: Text.PlainText
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.heading
+        }
+
+        Column {
+          id: info
+          anchors.left: usbGlyph.right
+          anchors.leftMargin: Style.spacing.lg
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: Style.space(1)
+
+          Text {
+            width: parent.width
+            text: Model.plain(stick.shownLabel)
+            textFormat: Text.PlainText
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            elide: Text.ElideRight
+          }
+
+          Text {
+            width: parent.width
+            visible: detail !== ""
+            text: detail
+            textFormat: Text.PlainText
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+
+            readonly property string detail: Model.usbDetail(stick.entry)
+          }
+        }
+      }
+    }
+
+    Item {
+      anchors.fill: parent
+      clip: true
+
+      Rectangle {
+        id: beam
+        width: Style.space(18)
+        height: parent.height * 2
+        y: -parent.height * 0.5
+        rotation: -28
+        transformOrigin: Item.Center
+        color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.22)
+      }
+
+      NumberAnimation {
+        id: shineSweep
+        target: beam
+        property: "x"
+        from: -beam.width
+        to: stick.width
         duration: 520
         easing.type: Easing.OutCubic
       }

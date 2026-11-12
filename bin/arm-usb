@@ -1,0 +1,338 @@
+#!/usr/bin/python3
+# Installed copy: /usr/local/libexec/io.github.07dcolem.target-boot/arm-usb
+# Root-owned, mode 0755. pkexec runs that path. The copy in the plugin
+# directory is the source for that install. It refuses to write firmware.
+# The load option arrives on standard input. It is not a path argument.
+
+import fcntl
+import os
+import re
+import select
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+EXPECTED = "/usr/local/libexec/io.github.07dcolem.target-boot/arm-usb"
+EFI = "/usr/bin/efibootmgr"
+VAR = "/usr/bin/efivar"
+GUID = "8be4df61-93ca-11d2-aa0d-00e098032b8c"
+LABEL = "Reboot into USB"
+LOADERS = (
+    "\\EFI\\BOOT\\BOOTX64.EFI",
+    "\\EFI\\BOOT\\BOOTIA32.EFI",
+    "\\EFI\\BOOT\\BOOTAA64.EFI",
+)
+CLEAN = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"}
+SERIAL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,64}")
+BOOT_ID = re.compile(r"[0-9A-F]{4}")
+OUT_MAX = 262144
+ERR_MAX = 8192
+
+
+def die(message):
+    sys.stderr.write(message + "\n")
+    raise SystemExit(2)
+
+
+def isolate():
+    if sys.flags.isolated and sys.flags.no_site:
+        return
+    real = os.path.realpath(__file__)
+    os.execv("/usr/bin/python3", ["/usr/bin/python3", "-I", "-S", real, *sys.argv[1:]])
+
+
+def read_utf16z(blob, off):
+    chars = []
+    end = off
+    while end + 1 < len(blob):
+        unit = int.from_bytes(blob[end:end + 2], "little")
+        end += 2
+        if unit == 0:
+            return "".join(chars), end
+        if unit < 32 or unit > 126 or len(chars) >= 80:
+            raise ValueError
+        chars.append(chr(unit))
+    raise ValueError
+
+
+def decode_serial(raw):
+    if len(raw) % 2 or not raw or len(raw) > 130:
+        raise ValueError
+    chars = []
+    for index in range(0, len(raw), 2):
+        unit = int.from_bytes(raw[index:index + 2], "little")
+        if unit < 33 or unit > 126:
+            raise ValueError
+        chars.append(chr(unit))
+    serial = "".join(chars)
+    if SERIAL.fullmatch(serial) is None:
+        raise ValueError
+    return serial
+
+
+def parse_load_option(blob):
+    """Accept only the load option this plugin builds. Anything else is refused."""
+    if not 16 <= len(blob) <= 512:
+        raise ValueError
+    if blob[0:4] != b"\x01\x00\x00\x00":
+        raise ValueError
+    path_len = int.from_bytes(blob[4:6], "little")
+    description, off = read_utf16z(blob, 6)
+    if description != LABEL:
+        raise ValueError
+    if path_len < 14 or off + path_len != len(blob):
+        raise ValueError
+    if off + 10 > len(blob) or blob[off] != 0x03 or blob[off + 1] != 0x10:
+        raise ValueError
+    wwid_len = int.from_bytes(blob[off + 2:off + 4], "little")
+    if wwid_len < 10 or off + wwid_len > len(blob):
+        raise ValueError
+    decode_serial(blob[off + 10:off + wwid_len])
+    off += wwid_len
+    if off + 4 > len(blob) or blob[off] != 0x04 or blob[off + 1] != 0x04:
+        raise ValueError
+    file_len = int.from_bytes(blob[off + 2:off + 4], "little")
+    if file_len < 6 or off + file_len > len(blob):
+        raise ValueError
+    loader, loader_end = read_utf16z(blob, off + 4)
+    if loader_end != off + file_len or loader not in LOADERS:
+        raise ValueError
+    off += file_len
+    if off + 4 != len(blob) or blob[off:off + 4] != b"\x7f\xff\x04\x00":
+        raise ValueError
+
+
+def assert_installed():
+    try:
+        real = os.path.realpath(__file__)
+        info = os.lstat(EXPECTED)
+        parent = os.lstat(os.path.dirname(EXPECTED))
+    except OSError:
+        die("This helper is not the installed copy")
+    if real != EXPECTED or stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        die("This helper is not the installed copy")
+    if info.st_uid != 0 or info.st_mode & 0o022:
+        die("This helper is not the installed copy")
+    if (not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode)
+            or parent.st_uid != 0 or parent.st_mode & 0o022):
+        die("This helper is not the installed copy")
+
+
+class Done:
+    def __init__(self, returncode, stdout, stderr):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def stop_group(proc):
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=0.4)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def run(args):
+    """Read at most the cap. A longer stream is rejected, not stored."""
+    deadline = time.monotonic() + 8
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=CLEAN,
+            start_new_session=True,
+        )
+    except OSError:
+        die("Could not read the EFI boot entries")
+    out = bytearray()
+    err = bytearray()
+    streams = [proc.stdout, proc.stderr]
+    overflow = False
+    timed_out = False
+    try:
+        for stream in streams:
+            os.set_blocking(stream.fileno(), False)
+        while streams:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            readable, _, _ = select.select(streams, [], [], min(0.2, remaining))
+            if not readable:
+                continue
+            for stream in readable:
+                try:
+                    chunk = os.read(stream.fileno(), 65536)
+                except BlockingIOError:
+                    continue
+                if chunk == b"":
+                    streams.remove(stream)
+                    continue
+                buf = out if stream is proc.stdout else err
+                limit = OUT_MAX if stream is proc.stdout else ERR_MAX
+                if len(buf) + len(chunk) > limit:
+                    overflow = True
+                    streams = []
+                    break
+                buf.extend(chunk)
+        if overflow or timed_out:
+            stop_group(proc)
+        else:
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                stop_group(proc)
+                timed_out = True
+    finally:
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
+    if overflow or timed_out or proc.returncode is None:
+        die("Could not read the EFI boot entries")
+    if len(out) > OUT_MAX or len(err) > ERR_MAX:
+        die("Could not read the EFI boot entries")
+    return Done(proc.returncode, bytes(out), bytes(err))
+
+
+def boot_order(text):
+    for line in text.splitlines():
+        match = re.fullmatch(r"BootOrder:\s*([0-9A-Fa-f, ]+)", line)
+        if match:
+            return re.sub(r"\s+", "", match.group(1)).upper()
+    die("Could not read the EFI boot entries")
+
+
+def label_of(text, boot_id):
+    for line in text.splitlines():
+        match = re.match(r"^Boot" + boot_id + r"([* ])\s*(.*)$", line)
+        if not match:
+            continue
+        return match.group(2).split("\t", 1)[0].strip()
+    return None
+
+
+def in_order(order, boot_id):
+    return (",%s," % boot_id) in (",%s," % order)
+
+
+def read_listing():
+    done = run([EFI])
+    if done.returncode != 0:
+        die("Could not read the EFI boot entries")
+    return done.stdout.decode("utf-8", "replace")
+
+
+def read_stdin_option():
+    """The bytes to write. Standard input, capped, then checked. Not a path."""
+    blob = sys.stdin.buffer.read(513)
+    if not 16 <= len(blob) <= 512:
+        die("The load option could not be read")
+    try:
+        parse_load_option(blob)
+    except ValueError:
+        die("The load option could not be read")
+    return blob
+
+
+def write_option(boot_id, blob):
+    handle = os.memfd_create("loadopt", 0)
+    try:
+        if os.write(handle, blob) != len(blob):
+            die("The load option could not be read")
+        os.lseek(handle, 0, os.SEEK_SET)
+        seals = (fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SHRINK
+                 | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL)
+        fcntl.fcntl(handle, fcntl.F_ADD_SEALS, seals)
+        path = "/proc/%d/fd/%d" % (os.getpid(), handle)
+        done = run([
+            VAR, "--name", "%s-Boot%s" % (GUID, boot_id),
+            "--write", "--datafile", path,
+        ])
+    finally:
+        os.close(handle)
+    if done.returncode != 0:
+        die("Next boot did not stick")
+
+
+def check_mode():
+    blob = sys.stdin.buffer.read(513)
+    if len(blob) > 512:
+        die("The load option could not be read")
+    try:
+        parse_load_option(blob)
+    except ValueError:
+        die("The load option could not be read")
+    sys.stdout.write("ok\n")
+
+
+def write_mode():
+    assert_installed()
+    if os.geteuid() != 0:
+        die("This helper is not the installed copy")
+    if len(sys.argv) < 2 or len(sys.argv) > 10:
+        die("The boot id was refused")
+    boot_id = sys.argv[1]
+    stale = sys.argv[2:]
+    if BOOT_ID.fullmatch(boot_id) is None or boot_id in stale:
+        die("The boot id was refused")
+    for item in stale:
+        if BOOT_ID.fullmatch(item) is None:
+            die("The boot id was refused")
+    blob = read_stdin_option()
+    text = read_listing()
+    before = boot_order(text)
+    if label_of(text, boot_id) is not None:
+        die("The boot id was refused")
+    for item in stale:
+        if in_order(before, item) or label_of(text, item) != LABEL:
+            die("That boot entry is not the USB entry")
+    for item in stale:
+        done = run([EFI, "--bootnum", item, "--delete-bootnum"])
+        if done.returncode != 0:
+            die("Could not remove the previous USB boot entry")
+        text = read_listing()
+        if boot_order(text) != before:
+            die("The firmware boot order changed")
+    if label_of(text, boot_id) is not None:
+        die("The boot id was refused")
+    write_option(boot_id, blob)
+    text = read_listing()
+    if boot_order(text) != before:
+        die("The firmware boot order changed")
+    done = run([EFI, "--bootnext", boot_id])
+    if done.returncode != 0:
+        run([EFI, "--bootnum", boot_id, "--delete-bootnum"])
+        die("Next boot did not stick")
+
+
+def main():
+    isolate()
+    if len(sys.argv) == 2 and sys.argv[1] == "--check":
+        check_mode()
+        return
+    write_mode()
+
+
+if __name__ == "__main__":
+    main()

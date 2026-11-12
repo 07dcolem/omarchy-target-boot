@@ -21,7 +21,43 @@ printf '%s\n' \
   $'Boot0005* Limine\tHD(1,GPT,0a8bf0ff-1cba-46c1-8769-bc6557984e51,0x800,0x400000)/\\EFI\\LIMINE\\LIMINE_X64.EFI' \
   $'Boot0006* UEFI OS\tHD(1,GPT,0a8bf0ff-1cba-46c1-8769-bc6557984e51,0x800,0x400000)/\\EFI\\BOOT\\BOOTX64.EFI0000424f' \
   $'Boot0007  Hidden Loader\tHD(1,GPT,aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee,0x800,0x1000)/\\EFI\\HIDDEN\\BOOTX64.EFI' \
+  $'Boot0008* Reboot into USB\tHD(1,GPT,11111111-2222-3333-4444-555555555555,0x800,0x1000)/\\EFI\\BOOT\\BOOTX64.EFI' \
   >"$fix"
+
+usb=$root/test/fixtures/usb.json
+match=$root/test/fixtures/usb-match.json
+cat >"$usb" <<'EOF'
+[
+  {
+    "key": "ABCD1234-1",
+    "label": "DVD_ROM",
+    "size": "28.7G",
+    "loader": "\\EFI\\BOOT\\BOOTX64.EFI",
+    "loaderName": "BOOTX64.EFI",
+    "disk": "/dev/sdz",
+    "part": 1,
+    "partuuid": "",
+    "model": "SanDisk Cruzer",
+    "serial": "ABCD1234"
+  }
+]
+EOF
+cat >"$match" <<'EOF'
+[
+  {
+    "key": "MATCHSTICK-2",
+    "label": "VENTOY",
+    "size": "57G",
+    "loader": "\\EFI\\BOOT\\BOOTX64.EFI",
+    "loaderName": "BOOTX64.EFI",
+    "disk": "/dev/sdy",
+    "part": 2,
+    "partuuid": "0a8bf0ff-1cba-46c1-8769-bc6557984e51",
+    "model": "SanDisk",
+    "serial": "MATCHSTICK"
+  }
+]
+EOF
 
 list=$("$cli" list --fixture "$fix")
 jq -e '
@@ -29,13 +65,156 @@ jq -e '
   and .bootCurrent == "0005"
   and .bootNext == "0001"
   and .bootOrder == ["0005","0001","0006"]
-  and ([.entries[].id] == ["0005","0001","0006","0007"])
+  and ([.entries[].id] == ["0005","0001","0006","0007","0008"])
   and (.entries[0].label == "Limine" and .entries[0].current == true and .entries[0].active == true)
   and (.entries[1].label == "Windows Boot Manager" and .entries[1].next == true)
   and (.entries[1].file == "\\EFI\\MICROSOFT\\BOOT\\BOOTMGFW.EFI")
   and (.entries[2].file == "\\EFI\\BOOT\\BOOTX64.EFI")
   and (.entries[3].active == false and .entries[3].label == "Hidden Loader")
+  and (.entries[4].label == "Reboot into USB" and .entries[4].owned == true and .entries[4].inOrder == false and .entries[4].removable == true)
+  and .usb == []
 ' <<<"$list" >/dev/null
+
+usb_list=$("$cli" list --fixture "$fix" --usb-fixture "$usb")
+jq -e '
+  .ok == true
+  and (.usb | length) == 1
+  and .usb[0].key == "ABCD1234-1"
+  and .usb[0].loader == "\\EFI\\BOOT\\BOOTX64.EFI"
+  and .usb[0].loaderName == "BOOTX64.EFI"
+  and .usb[0].part == 1
+  and .usb[0].existingId == null
+  and .usb[0].next == false
+  and .usb[0].disk == "/dev/sdz"
+' <<<"$usb_list" >/dev/null
+
+usb_dry=$("$cli" reboot-into-usb ABCD1234-1 --dry-run --fixture "$fix" --usb-fixture "$usb")
+jq -e '
+  .ok == true and .dryRun == true and .action == "reboot-into-usb" and .key == "ABCD1234-1"
+  and .argv == ["/usr/bin/efibootmgr","--create-only","--bootnum","0000","--disk","/dev/sdz","--part","1","--label","Reboot into USB","--loader","\\EFI\\BOOT\\BOOTX64.EFI","--bootnext","0000"]
+  and .cleanup == ["0008"]
+  and (.reboot == ["/usr/bin/omarchy-system-reboot"] or .reboot == ["/usr/bin/systemctl","reboot","--no-wall"])
+' <<<"$usb_dry" >/dev/null
+
+whole=$root/test/fixtures/usb-whole.json
+cat >"$whole" <<'EOF'
+[
+  {
+    "key": "WHOLEDISK-0",
+    "label": "DVD_ROM",
+    "size": "28.7G",
+    "loader": "\\EFI\\BOOT\\BOOTX64.EFI",
+    "loaderName": "BOOTX64.EFI",
+    "disk": "/dev/sdz",
+    "part": 0,
+    "partuuid": "",
+    "model": "SanDisk Cruzer",
+    "serial": "WHOLEDISK",
+    "usbVendor": "0781",
+    "usbProduct": "5575",
+    "usbInterface": "00"
+  }
+]
+EOF
+whole_dry=$("$cli" reboot-into-usb WHOLEDISK-0 --dry-run --fixture "$fix" --usb-fixture "$whole")
+# A partitionless stick is one root-owned helper. The load option is that
+# helper's standard input, so the dry-run argv has no path. BootNext is not
+# a second pkexec. 0008 is owned and not in order, so it is an argument of
+# that same helper.
+whole_hex='0100000050005200650062006f006f007400200069006e0074006f002000550053004200000003101c00000081077555570048004f004c0045004400490053004b00040430005c004500460049005c0042004f004f0054005c0042004f004f0054005800360034002e0045004600490000007fff0400'
+jq -e --arg hex "$whole_hex" '
+  .ok == true and .dryRun == true
+  and .argv == ["/usr/local/libexec/io.github.07dcolem.target-boot/arm-usb","0000","0008"]
+  and (has("bootnext") | not)
+  and .loadOption == $hex
+  and .cleanup == ["0008"]
+' <<<"$whole_dry" >/dev/null
+python3 -I -S -c 'import sys; sys.stdout.buffer.write(bytes.fromhex(sys.stdin.read().strip()))' <<<"$whole_hex" \
+  | python3 -I -S "$root/bin/arm-usb" --check | grep -qx ok
+python3 -I -S -c 'import sys; sys.stdout.buffer.write(bytes.fromhex(sys.stdin.read().strip())[:-1])' <<<"$whole_hex" \
+  | python3 -I -S "$root/bin/arm-usb" --check >/dev/null 2>&1 && { echo "short load option was accepted" >&2; exit 1; }
+set +e
+refused=$("$root/bin/arm-usb" 0000 /proc/1/fd/0 2>&1)
+refused_status=$?
+set -e
+[[ $refused_status -ne 0 ]]
+[[ $refused == *"not the installed copy"* ]]
+whole_file=$(mktemp)
+python3 -I -S -c 'import sys; sys.stdout.buffer.write(bytes.fromhex(sys.stdin.read().strip()))' <<<"$whole_hex" >"$whole_file"
+whole_dump=$(/usr/bin/efibootdump -f "$whole_file")
+rm -f -- "$whole_file"
+[[ $whole_dump == *'Reboot into USB'* ]]
+[[ $whole_dump == *'UsbWwid(781,5575,0,'* ]]
+[[ $whole_dump == *'\EFI\BOOT\BOOTX64.EFI'* ]]
+
+cat >"$whole" <<'EOF'
+[
+  {
+    "key": "WHOLEDISK-0",
+    "label": "DVD_ROM",
+    "size": "28.7G",
+    "loader": "\\EFI\\BOOT\\BOOTX64.EFI",
+    "loaderName": "BOOTX64.EFI",
+    "disk": "/dev/sdz",
+    "part": 0,
+    "partuuid": "",
+    "model": "SanDisk Cruzer",
+    "serial": "WHOLEDISK"
+  }
+]
+EOF
+set +e
+whole_missing=$("$cli" reboot-into-usb WHOLEDISK-0 --dry-run --fixture "$fix" --usb-fixture "$whole" 2>/dev/null)
+whole_missing_status=$?
+set -e
+[[ $whole_missing_status -ne 0 ]]
+jq -e '.ok == false and (.error | test("identify"))' <<<"$whole_missing" >/dev/null
+
+# The firmware text drops the last serial character. One owned entry whose
+# path contains the rest is reused. A firmware USB row with the same fragment
+# is not owned, so it is not selected.
+reuse_fix=$(mktemp)
+reuse_usb=$(mktemp)
+printf '%s\n' \
+  'BootCurrent: 0005' \
+  'BootOrder: 0005,0000' \
+  $'Boot0000* Reboot into USB\tUsbWwid(781,5575,0,ABCDEFGH1)/\\EFI\\BOOT\\BOOTX64.EFI' \
+  $'Boot0005* Limine\tHD(1,GPT,0a8bf0ff-1cba-46c1-8769-bc6557984e51,0x800,0x400000)/\\EFI\\LIMINE\\LIMINE_X64.EFI' \
+  $'Boot0007* UEFI: SanDisk\tPciRoot(0x0)/Pci(0x14,0x0)/USB(4,0)/CDROM(1,0x928,0x119b00)ABCDEFGH1' \
+  >"$reuse_fix"
+cat >"$reuse_usb" <<'EOF'
+[
+  {
+    "key": "ABCDEFGH12-0",
+    "label": "DVD_ROM",
+    "size": "28.7G",
+    "loader": "\\EFI\\BOOT\\BOOTX64.EFI",
+    "loaderName": "BOOTX64.EFI",
+    "disk": "/dev/sdz",
+    "part": 0,
+    "partuuid": "",
+    "model": "Example Cruzer",
+    "serial": "ABCDEFGH12",
+    "usbVendor": "0781",
+    "usbProduct": "5575",
+    "usbInterface": "00"
+  }
+]
+EOF
+reuse_dry=$("$cli" reboot-into-usb ABCDEFGH12-0 --dry-run --fixture "$reuse_fix" --usb-fixture "$reuse_usb")
+rm -f -- "$reuse_fix" "$reuse_usb"
+jq -e '
+  .ok == true and .dryRun == true
+  and .argv == ["/usr/bin/efibootmgr","--bootnext","0000"]
+  and .cleanup == []
+' <<<"$reuse_dry" >/dev/null
+
+match_dry=$("$cli" bootnext-usb MATCHSTICK-2 --dry-run --fixture "$fix" --usb-fixture "$match")
+jq -e '
+  .ok == true and .dryRun == true and .action == "bootnext-usb" and .key == "MATCHSTICK-2"
+  and .argv == ["/usr/bin/efibootmgr","--bootnext","0006"]
+  and .cleanup == ["0008"]
+' <<<"$match_dry" >/dev/null
 
 dry=$("$cli" reboot-into 0001 --dry-run --fixture "$fix")
 jq -e '
@@ -68,21 +247,39 @@ set -e
 [[ $fixture_status -ne 0 ]]
 jq -e '.ok == false and (.error | test("fixture"))' <<<"$fixture_write" >/dev/null
 
-# The helper may read BootOrder. It must not hand a write flag to efibootmgr,
-# and it must not call any other firmware tool.
-if grep -E -n -- '--bootorder|bootctl|set-default|--create|--delete-bootnum|--timeout|(^|[^[:alnum:]_-])--active([^[:alnum:]_-]|$)|--inactive' "$cli"; then
+set +e
+usb_write=$("$cli" reboot-into-usb ABCD1234-1 --fixture "$fix" --usb-fixture "$usb" 2>/dev/null)
+usb_write_status=$?
+set -e
+[[ $usb_write_status -ne 0 ]]
+jq -e '.ok == false and (.error | test("fixture"))' <<<"$usb_write" >/dev/null
+
+set +e
+bad_usb=$("$cli" reboot-into-usb '../sda' --dry-run --fixture "$fix" --usb-fixture "$usb" 2>/dev/null)
+bad_usb_status=$?
+set -e
+[[ $bad_usb_status -ne 0 ]]
+jq -e '.ok == false' <<<"$bad_usb" >/dev/null
+
+# The helper may read BootOrder. A USB boot may create one entry with
+# --create-only, and may delete an owned entry that is not in BootOrder.
+# Bare --create would insert the new id into BootOrder.
+if grep -E -n -- '--bootorder|bootctl|set-default|(^|[^[:alnum:]_-])--create([^[:alnum:]_-]|$)|--timeout|(^|[^[:alnum:]_-])--active([^[:alnum:]_-]|$)|--inactive' "$cli"; then
   echo "forbidden firmware operation is present in $cli" >&2
   exit 1
 fi
+grep -q -- '--create-only' "$cli"
+grep -q -- '--delete-bootnum' "$cli"
+grep -q 'owned == true and .inOrder != true' "$cli"
 
-# Every efibootmgr mention is the pinned system path, a comment, a read, or
-# one of the two BootNext writes.
+# Every efibootmgr mention is the pinned system path, a comment, a read,
+# BootNext, a create-only USB entry, or deletion of an owned entry.
 while IFS= read -r line; do
   [[ $line == *efibootmgr* ]] || continue
   case $line in
     *'EFIBOOTMGR=/usr/bin/efibootmgr'*|*'efibootmgr is not installed'*|*'# '*)
       ;;
-    *'--bootnext'*|*'--delete-bootnext'*)
+    *'--create-only'*|*'--delete-bootnum'*|*'--bootnext'*|*'--delete-bootnext'*)
       ;;
     *)
       echo "unexpected efibootmgr invocation: $line" >&2
@@ -100,8 +297,85 @@ fi
 
 # Privileged and parsing tools stay on absolute paths. command -v would
 # accept a shadow earlier in the caller's PATH.
-if grep -n -E 'command -v .*(efibootmgr|sudo|pkexec|jq|systemctl|omarchy-system-reboot)' "$cli"; then
+if grep -n -E 'command -v .*(efibootmgr|sudo|pkexec|jq|systemctl|omarchy-system-reboot|efivar|python3)' "$cli"; then
   echo "a privileged tool is resolved through PATH" >&2
+  exit 1
+fi
+
+# efivar writes one Boot#### load option and nothing else. The name is the
+# EFI global GUID plus Boot and four hex digits. --append, --import, and
+# --export would change a different variable or skip the write.
+if grep -n -E -- '--append|--import|--export|--attributes' "$cli"; then
+  echo "efivar is used for more than one Boot entry write" >&2
+  exit 1
+fi
+grep -q '8be4df61-93ca-11d2-aa0d-00e098032b8c' "$cli"
+grep -q -F 'priv_exec "$ARM_USB" "$id" "${STALE_IDS[@]}"' "$cli"
+grep -q 'CAPTURE_FD=$LOADOPT_FD' "$cli"
+grep -q 'SEALED_PATH="/proc/$$/fd/${LOADOPT_FD}"' "$cli"
+grep -q '/usr/local/libexec/io.github.07dcolem.target-boot/arm-usb' "$cli"
+grep -q '/usr/local/libexec/io.github.07dcolem.target-boot/arm-usb' "$root/bin/arm-usb"
+grep -q -- '"--write", "--datafile"' "$root/bin/arm-usb"
+grep -q 'memfd_create("loadopt"' "$root/bin/arm-usb"
+grep -q 'sys.stdin.buffer.read(513)' "$root/bin/arm-usb"
+if grep -n 'priv_exec "$ARM_USB".*\(data_path\|SEALED_PATH\)' "$cli"; then
+  echo "the load option path would be an argument of the root helper" >&2
+  exit 1
+fi
+if grep -n 'mktemp' "$cli" | grep -v 'mktemp -p'; then
+  echo "a temporary file is not confined to its destination directory" >&2
+  exit 1
+fi
+if grep -n 'StdioCollector' "$root/Panel.qml"; then
+  echo "a process still collects output without a cap" >&2
+  exit 1
+fi
+if grep -n -E 'capture_output=True|communicate\(' "$root/bin/arm-usb"; then
+  echo "the root helper collects output before the cap" >&2
+  exit 1
+fi
+grep -q '<allow_active>auth_admin</allow_active>' "$root/polkit/io.github.07dcolem.target-boot.policy"
+if grep -n -E 'auth_admin_keep|<allow_active>yes</allow_active>|<allow_any>yes</allow_any>' "$root/polkit/io.github.07dcolem.target-boot.policy"; then
+  echo "the USB helper policy would skip the password" >&2
+  exit 1
+fi
+if grep -n -E 'bash[[:space:]]+-c|sh[[:space:]]+-c' "$cli" "$root/bin/arm-usb"; then
+  echo "a shell string would be executed" >&2
+  exit 1
+fi
+python3 -I -S - "$root/bin/arm-usb" <<'PY'
+import contextlib
+import io
+import sys
+import time
+path = sys.argv[1]
+ns = {"__name__": "arm_usb", "__file__": path}
+with open(path, "r", encoding="utf-8") as handle:
+    exec(compile(handle.read(), path, "exec"), ns)
+run = ns["run"]
+done = run(["/usr/bin/printf", "ok"])
+if done.returncode != 0 or done.stdout != b"ok":
+    sys.exit("short command was not kept")
+
+def expect_stop(args):
+    sink = io.StringIO()
+    with contextlib.redirect_stderr(sink):
+        try:
+            run(args)
+        except SystemExit as exc:
+            if exc.code != 2:
+                sys.exit("stop exit was %s" % exc.code)
+            return
+    sys.exit("a command past the cap was kept")
+
+expect_stop(["/usr/bin/printf", "%s", "x" * 300000])
+started = time.monotonic()
+expect_stop(["/usr/bin/sleep", "30"])
+if time.monotonic() - started > 12:
+    sys.exit("the deadline was longer than 12 seconds")
+PY
+if grep -n -E -- '--bootorder|bootctl|set-default|(^|[^[:alnum:]_-])--create([^[:alnum:]_-]|$)|--append|--import|--export|--attributes' "$root/bin/arm-usb"; then
+  echo "the USB helper has a forbidden firmware operation" >&2
   exit 1
 fi
 

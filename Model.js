@@ -31,7 +31,9 @@ function normalizeId(id) {
 }
 
 function plain(text) {
-  return String(text || "").replace(/[<>]/g, "")
+  return String(text || "")
+    .replace(/[\u0000-\u001F\u007F-\u009F\u202A-\u202E\u2066-\u2069]/g, "")
+    .replace(/[<>&]/g, "")
 }
 
 // Display names are short labels typed in the panel. Cap the read and the
@@ -39,7 +41,7 @@ function plain(text) {
 function cleanName(text) {
   var value = String(text || "")
   if (value.length > 200) value = value.slice(0, 200)
-  value = value.replace(/[\u0000-\u001F\u007F]/g, "").replace(/[<>]/g, "").replace(/^\s+|\s+$/g, "")
+  value = value.replace(/[\u0000-\u001F\u007F-\u009F\u202A-\u202E\u2066-\u2069]/g, "").replace(/[<>&]/g, "").replace(/^\s+|\s+$/g, "")
   if (value.length > 80) value = value.slice(0, 80).replace(/\s+$/g, "")
   return value
 }
@@ -168,6 +170,9 @@ function visibleEntries(firmware, showInactive, hiddenIds) {
     var entry = entries[i]
     if (!entry) continue
     if (!showInactive && entry.active !== true) continue
+    // A one-shot USB entry is not an operating system. The USB section is
+    // the row for that stick, including when firmware has saved the entry.
+    if (entry.owned === true) continue
     var id = normalizeId(entry.id)
     if (id && hidden[id]) continue
     out.push(entry)
@@ -344,8 +349,81 @@ function offerTarget(firmware, names, seen) {
   if (!current) return null
   var id = normalizeId(current.id)
   if (!id) return null
+  if (current.removable === true || current.owned === true) return null
   if (iconFor(current, names) === omarchyIcon()) return null
   return { id: id, label: displayLabel(current, names) }
+}
+
+function usbIcon() {
+  return "󰕓"
+}
+
+function allowedLoader(name) {
+  return name === "BOOTX64.EFI" || name === "BOOTIA32.EFI" || name === "BOOTAA64.EFI"
+}
+
+// The panel only needs a display key. Disk paths stay in the helper.
+function sanitizeUsb(raw) {
+  var list = asList(raw)
+  var out = []
+  var seen = {}
+  var n = list.length > 32 ? 32 : list.length
+  for (var i = 0; i < n && out.length < 8; i++) {
+    var item = list[i]
+    if (!item || typeof item !== "object") continue
+    var key = String(item.key || "")
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$/.test(key) || seen[key]) continue
+    var loaderName = String(item.loaderName || "")
+    if (!allowedLoader(loaderName)) continue
+    var label = cleanName(item.label) || "USB drive"
+    var size = String(item.size || "").replace(/[^0-9A-Za-z.]/g, "")
+    if (size.length > 16) size = size.slice(0, 16)
+    seen[key] = true
+    out.push({
+      key: key,
+      label: label,
+      size: size,
+      loaderName: loaderName,
+      existingId: normalizeId(item.existingId),
+      next: item.next === true
+    })
+  }
+  return out
+}
+
+function presentUsb(firmware, hiddenView) {
+  if (hiddenView === true) return []
+  var usb = sanitizeUsb(firmware && firmware.usb)
+  var id = normalizeId(firmware && firmware.bootNext)
+  var nextEntry = entryById(firmware && firmware.entries, id)
+  var ownedNext = !!(id && nextEntry && nextEntry.owned === true)
+  for (var i = 0; i < usb.length; i++) {
+    var hit = !!(id && usb[i].existingId === id)
+    usb[i].next = hit || (ownedNext && usb.length === 1) || usb[i].next === true
+  }
+  return usb
+}
+
+function usbDetail(item) {
+  if (!item) return ""
+  var bits = []
+  if (item.next === true) bits.push("Next boot")
+  if (item.size) bits.push(String(item.size))
+  if (item.loaderName) bits.push(String(item.loaderName))
+  return bits.join("  ·  ")
+}
+
+function nextBootLabel(firmware, names) {
+  var id = normalizeId(firmware && firmware.bootNext)
+  var usb = presentUsb(firmware, false)
+  for (var i = 0; i < usb.length; i++) {
+    if (usb[i].next === true) return usb[i].label
+  }
+  if (!id) return ""
+  var entry = entryById(firmware && firmware.entries, id)
+  if (!entry) return ""
+  if (entry.owned === true) return usb.length === 1 ? usb[0].label : "USB drive"
+  return displayLabel(entry, names)
 }
 
 if (typeof module !== "undefined") {
@@ -371,6 +449,11 @@ if (typeof module !== "undefined") {
     omarchyMarkRows: omarchyMarkRows,
     offerLine: offerLine,
     offerTarget: offerTarget,
+    usbIcon: usbIcon,
+    sanitizeUsb: sanitizeUsb,
+    presentUsb: presentUsb,
+    usbDetail: usbDetail,
+    nextBootLabel: nextBootLabel,
     visibleEntries: visibleEntries,
     hiddenEntries: hiddenEntries,
     entryById: entryById,

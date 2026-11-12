@@ -1,0 +1,14 @@
+[
+  {
+    "key": "WHOLEDISK-0",
+    "label": "DVD_ROM",
+    "size": "28.7G",
+    "loader": "\\EFI\\BOOT\\BOOTX64.EFI",
+    "loaderName": "BOOTX64.EFI",
+    "disk": "/dev/sdz",
+    "part": 0,
+    "partuuid": "",
+    "model": "SanDisk Cruzer",
+    "serial": "WHOLEDISK"
+  }
+]

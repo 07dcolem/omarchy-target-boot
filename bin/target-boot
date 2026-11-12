@@ -3,16 +3,21 @@
 #
 # Read the firmware boot menu and set the one-shot BootNext variable.
 #
-# The write path is two calls and nothing else:
-#   /usr/bin/efibootmgr --bootnext XXXX
-#   /usr/bin/efibootmgr --delete-bootnext
-# A read is `/usr/bin/efibootmgr` with no arguments. Boot order is parsed so
-# it can be compared after a write. It is never passed back to efibootmgr.
+# Firmware writes are BootNext, deleting BootNext, and, for a plugged-in USB
+# drive only, one temporary boot entry. A partitioned stick is created with
+# efibootmgr --create-only so it is not added to BootOrder, then selected
+# with --bootnext in that same command. A stick with no partition table is
+# armed by one root-owned helper, which writes one Boot#### load option and
+# then selects it. The load option is that helper's standard input. This
+# script never passes itself, a shell string, or a plugin file to pkexec.
+# A previous entry with this plugin's label is removed only when it
+# is not in BootOrder. BootOrder is parsed so it can be compared after a
+# write. It is never passed back.
 
 set -euo pipefail
 IFS=$' \t\n'
 
-VERSION="1.3.2"
+VERSION="1.4.0"
 
 # Privileged programs are absolute paths. PATH is reset to system directories
 # before any other command is looked up, and nothing looked up on PATH is
@@ -24,6 +29,32 @@ JQ=/usr/bin/jq
 SYSTEMCTL=/usr/bin/systemctl
 OMARCHY_REBOOT=/usr/bin/omarchy-system-reboot
 OMARCHY_BIN=/usr/share/omarchy/bin
+LSBLK=/usr/bin/lsblk
+FINDMNT=/usr/bin/findmnt
+UDISKSCTL=/usr/bin/udisksctl
+TIMEOUT_BIN=/usr/bin/timeout
+SETSID=/usr/bin/setsid
+HEAD=/usr/bin/head
+CAT=/usr/bin/cat
+TR=/usr/bin/tr
+OD=/usr/bin/od
+WC=/usr/bin/wc
+SHA256=/usr/bin/sha256sum
+PYTHON=/usr/bin/python3
+READLINK=/usr/bin/readlink
+# Writes one Boot#### variable. The name is this GUID plus Boot and four
+# hex digits chosen here. Nothing else is passed to --name. The partitionless
+# helper calls this binary. This script does not elevate it on its own.
+EFIVAR=/usr/bin/efivar
+EFI_GUID="8be4df61-93ca-11d2-aa0d-00e098032b8c"
+# Root-owned helper for a partitionless stick that does not already have an
+# entry. pkexec runs this path only. The copy beside this script is the
+# source that gets installed there. It is never the program pkexec runs.
+ARM_USB=/usr/local/libexec/io.github.07dcolem.target-boot/arm-usb
+# Fixed firmware label for the one-shot USB entry. It is how a later read
+# recognises an entry this plugin created. Volume names from the stick are
+# never written into firmware.
+USB_LABEL="Reboot into USB"
 
 # Root-owned, not writable by group or other. A symlink is accepted only when
 # its final target stays under /usr or /bin and passes the same checks.
@@ -89,69 +120,109 @@ fail() {
 usage() {
   cat <<'EOF'
 Usage:
-  target-boot list [--fixture FILE]
+  target-boot list [--fixture FILE] [--usb-fixture FILE]
   target-boot bootnext HEXID [--dry-run] [--fixture FILE]
   target-boot clear-next [--dry-run] [--fixture FILE]
   target-boot reboot-into HEXID [--dry-run] [--fixture FILE]
+  target-boot bootnext-usb KEY [--dry-run] [--fixture FILE] [--usb-fixture FILE]
+  target-boot reboot-into-usb KEY [--dry-run] [--fixture FILE] [--usb-fixture FILE]
 
-list prints the firmware boot entries as JSON.
+list prints the firmware boot entries as JSON, plus plugged-in USB drives
+that have a fallback loader.
 bootnext writes BootNext and leaves every other firmware setting alone.
 clear-next removes BootNext.
 reboot-into writes BootNext, checks that it stuck and that the boot order
 is unchanged, then reboots through /usr/bin/omarchy-system-reboot.
+bootnext-usb and reboot-into-usb do the same for a USB drive key from list.
+A new firmware entry is created only when no existing entry already points
+at that drive, and it is left out of the saved boot order. A partitionless
+drive that has no entry yet is armed by the root-owned helper in one
+authorization. An entry that already names that stick is only selected.
 
 --dry-run prints the argv it would run and does not touch firmware.
 --fixture reads a saved firmware listing. A fixture is refused for a real write.
+--usb-fixture reads a saved USB listing. It is refused for a real write.
 EOF
 }
 
 json_argv() {
+  local joined
   if (($# == 0)); then
     printf '[]\n'
     return
   fi
-  printf '%s\n' "$@" | jq -R . | jq -cs .
+  # Record separator, not newline, so one argument can contain a newline.
+  joined=$(printf '%s\x1e' "$@")
+  printf '%s' "$joined" | jq -Rs 'split("\u001e") | .[:-1]'
 }
 
+# Stdout and stderr are capped while the command runs. Nothing is stored in
+# /tmp. There is no deadline here: pkexec waits for the polkit prompt, and a
+# short timeout would cancel that prompt. CAPTURE_FD, when set, is an open
+# descriptor duplicated onto the command's standard input.
 capture() {
-  local out err
-  out=$(mktemp)
-  err=$(mktemp)
+  local in_fd="" max=262144 emax=8192
+  local out_w err_w out_keep err_keep status out_len err_len
+  if [[ ${CAPTURE_FD:-} =~ ^[0-9]+$ ]]; then
+    in_fd=$CAPTURE_FD
+  elif [[ -n ${CAPTURE_FD:-} ]]; then
+    CAP_STATUS=1
+    CAP_OUT=""
+    CAP_ERR="output exceeds limit"
+    return
+  fi
+  trusted_executable "$HEAD" || { CAP_STATUS=127; CAP_OUT=""; CAP_ERR="head is not installed"; return; }
+  trusted_executable "$CAT" || { CAP_STATUS=127; CAP_OUT=""; CAP_ERR="cat is not installed"; return; }
+  trusted_executable "$WC" || { CAP_STATUS=127; CAP_OUT=""; CAP_ERR="wc is not installed"; return; }
+  # Bash closes coproc descriptors inside a subshell, so the command stays
+  # in this shell. The read ends are duplicated first: bash drops the coproc
+  # array when head exits.
+  coproc CAPOUT { "$HEAD" -c $((max + 1)); }
+  coproc CAPERR { "$HEAD" -c $((emax + 1)); }
+  out_w=${CAPOUT[1]}
+  err_w=${CAPERR[1]}
+  exec {out_keep}<&"${CAPOUT[0]}"
+  exec {err_keep}<&"${CAPERR[0]}"
   set +e
-  "$@" >"$out" 2>"$err"
-  CAP_STATUS=$?
+  if [[ -n $in_fd ]]; then
+    "$@" <&"$in_fd" >&"$out_w" 2>&"$err_w"
+  else
+    "$@" >&"$out_w" 2>&"$err_w"
+  fi
+  status=$?
   set -e
-  CAP_OUT=$(cat -- "$out")
-  CAP_ERR=$(cat -- "$err")
-  rm -f -- "$out" "$err"
+  exec {out_w}>&-
+  exec {err_w}>&-
+  CAP_OUT=$("$CAT" <&"$out_keep")
+  CAP_ERR=$("$CAT" <&"$err_keep")
+  exec {out_keep}<&-
+  exec {err_keep}<&-
+  out_len=$(printf '%s' "$CAP_OUT" | "$WC" -c)
+  err_len=$(printf '%s' "$CAP_ERR" | "$WC" -c)
+  out_len=${out_len//[[:space:]]/}
+  err_len=${err_len//[[:space:]]/}
+  if [[ ! $out_len =~ ^[0-9]+$ || ! $err_len =~ ^[0-9]+$ || $out_len -gt $max || $err_len -gt $emax ]]; then
+    CAP_STATUS=1
+    CAP_OUT=""
+    CAP_ERR="output exceeds limit"
+    return
+  fi
+  CAP_STATUS=$status
 }
 
 # Root via passwordless sudo when the machine offers it, otherwise the
-# session polkit agent. The elevated program is the pinned efibootmgr, never
-# a path taken from PATH. pkexec treats a leading -- as the program name, so
-# the binary is the first argument. The helper itself stays the logged-in
-# user so the reboot runs in that user's systemd session.
+# session polkit agent. The elevated program is the pinned efibootmgr, or
+# the root-owned USB helper. Never a path taken from PATH, and never a
+# shell string. pkexec treats a leading -- as the program name, so the
+# binary is the first argument. This script stays the logged-in user so
+# the reboot runs in that user's systemd session.
 require_efi() {
   trusted_executable "$EFIBOOTMGR" || fail "efibootmgr is not installed"
 }
 
 efi_exec() {
   require_efi
-  if [[ $(id -u) -eq 0 ]]; then
-    capture "$EFIBOOTMGR" "$@"
-    return
-  fi
-  if trusted_executable "$SUDO" && "$SUDO" -n /usr/bin/true >/dev/null 2>&1; then
-    capture "$SUDO" -n -- "$EFIBOOTMGR" "$@"
-    return
-  fi
-  if ! trusted_executable "$PKEXEC"; then
-    CAP_STATUS=127
-    CAP_OUT=""
-    CAP_ERR="pkexec was not found"
-    return
-  fi
-  capture "$PKEXEC" "$EFIBOOTMGR" "$@"
+  priv_exec "$EFIBOOTMGR" "$@"
 }
 
 efi_detail() {
@@ -233,6 +304,7 @@ parse_listing() {
     --arg current "$boot_current" \
     --arg next "$boot_next" \
     --arg order "$order_csv" \
+    --arg owned "$USB_LABEL" \
     '
       ($order | split(",") | map(select(length > 0))) as $ids
       | . as $all
@@ -246,8 +318,12 @@ parse_listing() {
           bootOrder: $ids,
           entries: ($rows | map(. + {
             current: (.id == $current),
-            next: ($next != "" and .id == $next)
-          }))
+            next: ($next != "" and .id == $next),
+            owned: (.label == $owned),
+            inOrder: (.id as $eid | ($ids | index($eid)) != null),
+            removable: (.label == $owned)
+          })),
+          usb: []
         }
     ' <<<"$entries"
 }
@@ -423,9 +499,352 @@ maybe_offer_omarchy() {
   /usr/bin/mv -f -T -- "$tmp" "$file"
 }
 
+# Read at most max+1 bytes. A longer result is rejected rather than clipped
+# into a value the next step would trust.
+bounded() {
+  local max=$1
+  shift
+  local out
+  [[ $max =~ ^[0-9]+$ ]] || return 1
+  trusted_executable "$TIMEOUT_BIN" || return 1
+  trusted_executable "$SETSID" || return 1
+  trusted_executable "$HEAD" || return 1
+  out=$(LC_ALL=C "$SETSID" -w "$TIMEOUT_BIN" -k 2 -- 8 "$@" | "$HEAD" -c $((max + 1))) || return 1
+  [[ ${#out} -le $max ]] || return 1
+  printf '%s' "$out"
+}
+
+clean_label() {
+  local value=$1
+  trusted_executable "$TR" || return 1
+  value=$(printf '%s' "$value" | "$TR" -d '\000-\037\177<>&') || return 1
+  value=${value#"${value%%[![:space:]]*}"}
+  value=${value%"${value##*[![:space:]]}"}
+  value=${value:0:80}
+  printf '%s' "$value"
+}
+
+usb_disk_path() {
+  [[ $1 =~ ^/dev/(sd[a-z]|nvme[0-9]+n[0-9]+)$ ]]
+}
+
+usb_part_path() {
+  [[ $1 =~ ^/dev/(sd[a-z][0-9]|sd[a-z][1-9][0-9]|nvme[0-9]+n[0-9]+p[0-9]|nvme[0-9]+n[0-9]+p[1-9][0-9])$ ]]
+}
+
+# Walk the allowlisted relative path. A symlink anywhere under the mount is
+# refused, so a stick cannot point the check at a file on this machine.
+regular_file() {
+  local root=$1 rel=$2 cur=$root part
+  [[ -d $cur && ! -L $cur ]] || return 1
+  local IFS=/
+  for part in $rel; do
+    [[ -n $part && $part != "." && $part != ".." ]] || return 1
+    cur="$cur/$part"
+    [[ -e $cur && ! -L $cur ]] || return 1
+  done
+  [[ -f $cur ]]
+}
+
+# The firmware path is the canonical fallback name, whatever case the
+# filesystem used for the same file.
+loader_at() {
+  local root=$1 rel canon
+  local -a rels=(
+    EFI/BOOT/BOOTX64.EFI
+    EFI/Boot/bootx64.efi
+    efi/boot/bootx64.efi
+    EFI/BOOT/BOOTIA32.EFI
+    EFI/Boot/bootia32.efi
+    efi/boot/bootia32.efi
+    EFI/BOOT/BOOTAA64.EFI
+    EFI/Boot/bootaa64.efi
+    efi/boot/bootaa64.efi
+  )
+  for rel in "${rels[@]}"; do
+    regular_file "$root" "$rel" || continue
+    case $rel in
+      EFI/BOOT/BOOTX64.EFI|EFI/Boot/bootx64.efi|efi/boot/bootx64.efi)
+        canon='\EFI\BOOT\BOOTX64.EFI'
+        ;;
+      EFI/BOOT/BOOTIA32.EFI|EFI/Boot/bootia32.efi|efi/boot/bootia32.efi)
+        canon='\EFI\BOOT\BOOTIA32.EFI'
+        ;;
+      *)
+        canon='\EFI\BOOT\BOOTAA64.EFI'
+        ;;
+    esac
+    printf '%s\n' "$canon"
+    return 0
+  done
+  return 1
+}
+
+# An existing mount under /run/media or /media. Anything else is ignored,
+# and this never unmounts a volume it did not mount itself.
+mount_of() {
+  local dev=$1 json target
+  trusted_executable "$FINDMNT" || return 1
+  json=$(bounded 8192 "$FINDMNT" -J -S "$dev") || return 1
+  target=$(jq -r '
+    first(.filesystems[]?
+      | select(.fstype == "vfat" or .fstype == "udf" or .fstype == "iso9660")
+      | .target) // empty
+  ' <<<"$json") || return 1
+  [[ $target == /run/media/* || $target == /media/* ]] || return 1
+  [[ $target != *..* && $target != *$'\n'* ]] || return 1
+  [[ -d "$target" && ! -L "$target" ]] || return 1
+  printf '%s\n' "$target"
+}
+
+udisks_mount() {
+  local dev=$1
+  trusted_executable "$UDISKSCTL" || return 1
+  "$SETSID" -w "$TIMEOUT_BIN" -k 2 -- 8 "$UDISKSCTL" mount -b "$dev" --no-user-interaction >/dev/null 2>&1
+}
+
+udisks_unmount() {
+  local dev=$1
+  trusted_executable "$UDISKSCTL" || return 1
+  "$SETSID" -w "$TIMEOUT_BIN" -k 2 -- 8 "$UDISKSCTL" unmount -b "$dev" --no-user-interaction >/dev/null 2>&1
+}
+
+scan_cleanup() {
+  if [[ -n ${SCAN_MOUNTED:-} ]]; then
+    udisks_unmount "$SCAN_MOUNTED" || true
+    SCAN_MOUNTED=""
+  fi
+}
+
+# Look at one block device. Prints the loader path when the fallback file is
+# there. Mounts only when nothing is mounted yet, and only that one device.
+probe_device() {
+  local dev=$1 target loader
+  if target=$(mount_of "$dev"); then
+    loader_at "$target" && return 0
+    return 1
+  fi
+  udisks_mount "$dev" || return 1
+  SCAN_MOUNTED=$dev
+  if target=$(mount_of "$dev") && loader=$(loader_at "$target"); then
+    scan_cleanup
+    printf '%s\n' "$loader"
+    return 0
+  fi
+  scan_cleanup
+  return 1
+}
+
+usb_key() {
+  local serial=$1 part=$2
+  [[ $serial =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,64}$ ]] || return 1
+  [[ $part =~ ^(0|[1-9][0-9]?)$ ]] || return 1
+  printf '%s-%s\n' "$serial" "$part"
+}
+
+# Removable USB disks only. One row per disk: the partition that has
+# \EFI\BOOT\BOOTX64.EFI, or the 32-bit or ARM fallback. A stick with no
+# partition table, such as a copied installer image, uses partition 0.
+# That stick is not created with efibootmgr: there is no partition node
+# to name. The write path builds a USB device path instead.
+scan_usb() {
+  local raw disks count i disk serial model size parts part_count
+  local chosen_path chosen_part chosen_uuid chosen_label loader key show lname items
+  SCAN_MOUNTED=""
+  trap scan_cleanup RETURN
+  items='[]'
+  trusted_executable "$LSBLK" || { printf '[]\n'; return 0; }
+  raw=$(bounded 262144 "$LSBLK" -J -o PATH,TRAN,RM,TYPE,FSTYPE,LABEL,SIZE,MODEL,VENDOR,SERIAL,PARTN,PARTUUID,PARTTYPE) || {
+    printf '[]\n'
+    return 0
+  }
+  disks=$(printf '%s' "$raw" | jq -c '
+    [ .blockdevices[]?
+      | select(.type == "disk" and .tran == "usb" and .rm == true)
+      | select((.size | tostring) != "0B" and (.size | tostring) != "0" and (.size | tostring) != "")
+      | {
+          disk: (.path // ""),
+          serial: (.serial // ""),
+          model: ((.vendor // "") + " " + (.model // "")),
+          size: (.size // ""),
+          fstype: (.fstype // ""),
+          label: (.label // ""),
+          parts: [ (.children // [])[]?
+            | select(.type == "part")
+            | {
+                path: (.path // ""),
+                part: .partn,
+                partuuid: (.partuuid // ""),
+                fstype: (.fstype // ""),
+                label: (.label // ""),
+                parttype: (.parttype // "")
+              }
+          ]
+        }
+    ] | .[0:8]
+  ') || { printf '[]\n'; return 0; }
+  count=$(jq -r 'length' <<<"$disks") || count=0
+  [[ $count =~ ^[0-9]+$ ]] || count=0
+  for ((i = 0; i < count && i < 8; i++)); do
+    disk=$(jq -r --argjson i "$i" '.[$i].disk' <<<"$disks")
+    serial=$(jq -r --argjson i "$i" '.[$i].serial' <<<"$disks")
+    model=$(jq -r --argjson i "$i" '.[$i].model' <<<"$disks")
+    size=$(jq -r --argjson i "$i" '.[$i].size' <<<"$disks")
+    usb_disk_path "$disk" || continue
+    [[ $size =~ ^[0-9A-Za-z.]{1,16}$ ]] || size=""
+    model=$(clean_label "$model") || model=""
+    model=$(printf '%s' "$model" | "$TR" -s ' ')
+    chosen_path=""
+    chosen_part=""
+    chosen_uuid=""
+    chosen_label=""
+    loader=""
+    part_count=$(jq -r --argjson i "$i" '.[$i].parts | length' <<<"$disks") || part_count=0
+    [[ $part_count =~ ^[0-9]+$ ]] || part_count=0
+    local p path part uuid fstype label parttype
+    for ((p = 0; p < part_count && p < 8; p++)); do
+      path=$(jq -r --argjson i "$i" --argjson p "$p" '.[$i].parts[$p].path' <<<"$disks")
+      part=$(jq -r --argjson i "$i" --argjson p "$p" '.[$i].parts[$p].part | tostring' <<<"$disks")
+      uuid=$(jq -r --argjson i "$i" --argjson p "$p" '.[$i].parts[$p].partuuid' <<<"$disks")
+      fstype=$(jq -r --argjson i "$i" --argjson p "$p" '.[$i].parts[$p].fstype' <<<"$disks")
+      label=$(jq -r --argjson i "$i" --argjson p "$p" '.[$i].parts[$p].label' <<<"$disks")
+      parttype=$(jq -r --argjson i "$i" --argjson p "$p" '.[$i].parts[$p].parttype' <<<"$disks")
+      usb_part_path "$path" || continue
+      [[ $part =~ ^[1-9][0-9]?$ ]] || continue
+      [[ $uuid =~ ^[0-9A-Fa-f-]{0,64}$ ]] || uuid=""
+      case $fstype in
+        vfat|udf|iso9660) ;;
+        *)
+          [[ ${parttype,,} == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" ]] || continue
+          ;;
+      esac
+      if loader=$(probe_device "$path"); then
+        chosen_path=$path
+        chosen_part=$part
+        chosen_uuid=$uuid
+        chosen_label=$label
+        break
+      fi
+    done
+    if [[ -z $loader && $part_count -eq 0 ]]; then
+      fstype=$(jq -r --argjson i "$i" '.[$i].fstype' <<<"$disks")
+      label=$(jq -r --argjson i "$i" '.[$i].label' <<<"$disks")
+      case $fstype in
+        vfat|udf|iso9660)
+          if loader=$(probe_device "$disk"); then
+            chosen_path=$disk
+            chosen_part=0
+            chosen_uuid=""
+            chosen_label=$label
+          fi
+          ;;
+      esac
+    fi
+    [[ -n $loader && -n $chosen_part ]] || continue
+    key=$(usb_key "$serial" "$chosen_part") || continue
+    show=$(clean_label "$chosen_label") || show=""
+    [[ -n $show ]] || show=$model
+    [[ -n $show ]] || show="USB drive"
+    lname=${loader##*\\}
+    case $lname in
+      BOOTX64.EFI|BOOTIA32.EFI|BOOTAA64.EFI) ;;
+      *) continue ;;
+    esac
+    items=$(jq -c \
+      --argjson items "$items" \
+      --arg key "$key" \
+      --arg label "$show" \
+      --arg size "$size" \
+      --arg loader "$loader" \
+      --arg loaderName "$lname" \
+      --arg disk "$disk" \
+      --arg part "$chosen_part" \
+      --arg partuuid "$chosen_uuid" \
+      --arg model "$model" \
+      --arg serial "$serial" \
+      '$items + [{
+        key: $key,
+        label: $label,
+        size: $size,
+        loader: $loader,
+        loaderName: $loaderName,
+        disk: $disk,
+        part: ($part | tonumber),
+        partuuid: $partuuid,
+        model: $model,
+        serial: $serial
+      }]' <<<"null") || items='[]'
+  done
+  printf '%s\n' "$items"
+}
+
+read_usb_fixture() {
+  local raw
+  [[ -n ${USB_FIXTURE:-} && -f $USB_FIXTURE && ! -L $USB_FIXTURE ]] || return 1
+  trusted_executable "$HEAD" || return 1
+  raw=$(LC_ALL=C "$HEAD" -c 8193 -- "$USB_FIXTURE") || return 1
+  [[ ${#raw} -le 8192 ]] || return 1
+  jq -c '
+    if type != "array" then error("usb fixture") else . end
+    | map(select(
+        (.key | type) == "string" and (.key | test("^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$"))
+        and (.disk | type) == "string" and (.disk | test("^/dev/(sd[a-z]|nvme[0-9]+n[0-9]+)$"))
+        and (.part | type) == "number" and .part >= 0 and .part <= 99
+        and (.loader | type) == "string"
+        and (.loader == "\\EFI\\BOOT\\BOOTX64.EFI"
+          or .loader == "\\EFI\\BOOT\\BOOTIA32.EFI"
+          or .loader == "\\EFI\\BOOT\\BOOTAA64.EFI")
+        and (.loaderName | type) == "string"
+        and (.partuuid | type) == "string"
+        and (.partuuid | test("^[0-9A-Fa-f-]{0,64}$"))
+      ))
+    | .[0:8]
+  ' <<<"$raw"
+}
+
+merge_usb() {
+  local usb_json=$1 merged
+  merged=$(jq -c --argjson usb "$usb_json" --arg owned "$USB_LABEL" '
+    def down: ascii_downcase;
+    def points_at($u):
+      ((.file | down | gsub("/"; "\\") | split("\\") | last) == ($u.loaderName | down))
+      and (($u.partuuid | length) > 0)
+      and ((.path | down) | contains($u.partuuid | down));
+    . as $doc
+    | .entries |= map(
+        . as $e
+        | .removable = (
+            ($e.owned == true)
+            or any($usb[]; (.partuuid | length) > 0
+              and (($e.path | down) | contains(.partuuid | down)))
+          )
+      )
+    | .usb = [
+        $usb[]
+        | . as $u
+        | .existingId = ([ $doc.entries[] | select(points_at($u)) | .id ] | first // null)
+        | .next = (.existingId != null and .existingId == $doc.bootNext)
+      ]
+  ' <<<"$PARSED") || return 1
+  PARSED=$merged
+}
+
+attach_usb() {
+  local usb='[]' scanned
+  if [[ -n ${USB_FIXTURE:-} ]]; then
+    scanned=$(read_usb_fixture) || scanned='[]'
+    usb=$scanned
+  elif [[ -z ${FIXTURE:-} ]]; then
+    scanned=$(scan_usb) || scanned='[]'
+    usb=$scanned
+  fi
+  merge_usb "$usb" || PARSED=$(jq -c '. + {usb: []}' <<<"$PARSED")
+}
+
 cmd_list() {
   load_firmware || { printf '%s\n' "$PARSED"; exit 1; }
   maybe_offer_omarchy || true
+  attach_usb
   printf '%s\n' "$PARSED"
 }
 
@@ -565,7 +984,554 @@ cmd_reboot_into() {
   jq -cn --arg id "$id" '{ok:true, action:"reboot-into", id:$id, bootNext:$id}'
 }
 
+next_free_id() {
+  local id
+  id=$(jq -r '
+    def hex2:
+      def digit: "0123456789ABCDEF"[.:.+1];
+      (((. / 16) | floor) | digit) + ((. % 16) | digit);
+    [ .entries[].id ] as $ids
+    | [ range(0; 255) | "00" + hex2 | select(. as $h | ($ids | index($h) | not)) ][0] // empty
+  ' <<<"$PARSED") || return 1
+  [[ $id =~ ^[0-9A-F]{4}$ ]] || return 1
+  printf '%s\n' "$id"
+}
+
+# The disk we are about to name in a firmware entry is still the removable
+# USB we just scanned, with the same serial.
+usb_still_present() {
+  local disk=$1 serial=$2 json
+  usb_disk_path "$disk" || return 1
+  [[ $serial =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,64}$ ]] || return 1
+  json=$(bounded 4096 "$LSBLK" -J -d -o PATH,TRAN,RM,TYPE,SERIAL -- "$disk") || return 1
+  jq -e --arg disk "$disk" --arg serial "$serial" '
+    any(.blockdevices[]?;
+      .path == $disk and .tran == "usb" and .rm == true and .type == "disk"
+      and .serial == $serial)
+  ' <<<"$json" >/dev/null
+}
+
+delete_stale_owned() {
+  local keep=$1 id order_now
+  while read -r id; do
+    [[ -n $id ]] || continue
+    id=$(normalize_id "$id") || continue
+    [[ -n $keep && $id == "$keep" ]] && continue
+    efi_exec --bootnum "$id" --delete-bootnum
+    if [[ ${CAP_STATUS:-1} -ne 0 ]]; then
+      auth_failure "remove the previous USB boot entry"
+    fi
+    load_firmware || fail "Could not read the EFI boot entries"
+    order_now=$(order_csv)
+    if [[ $order_now != "$BEFORE_ORDER" ]]; then
+      fail "The firmware boot order changed, so nothing further was run"
+    fi
+  done < <(jq -r --arg owned "$USB_LABEL" --arg keep "$keep" '
+    .entries[] | select(.owned == true and .inOrder != true and .id != $keep) | .id
+  ' <<<"$PARSED")
+}
+
+# Little-endian uint16. n is a number this script computed, already bounded.
+le16() {
+  local n=$1
+  [[ $n =~ ^[0-9]+$ ]] || return 1
+  (( n <= 65535 )) || return 1
+  printf "\\$(printf '%03o' $((n & 255)))\\$(printf '%03o' $(((n >> 8) & 255)))"
+}
+
+# ASCII only. The loader is an allowlisted path and the serial was checked.
+utf16_ascii() {
+  local s=$1 i ch
+  for ((i = 0; i < ${#s}; i++)); do
+    ch=${s:i:1}
+    printf '%s\0' "$ch"
+  done
+}
+
+# EFI load option: active, description "Reboot into USB", then a USB WWID
+# node (vendor, product, interface, serial) and the fallback loader.
+# efibootmgr cannot build this. A partition of 0 makes no HD() node, and
+# this kernel's efiboot library has no USB device-path probe, so the
+# ordinary create fails before it writes anything.
+emit_load_option() {
+  local vn=$1 pn=$2 ifn=$3 serial=$4 loader=$5
+  local slen llen wwid_len file_len path_len
+  [[ $vn =~ ^[0-9]+$ && $pn =~ ^[0-9]+$ && $ifn =~ ^[0-9]+$ ]] || return 1
+  (( vn <= 65535 && pn <= 65535 && ifn <= 65535 )) || return 1
+  [[ $serial =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,64}$ ]] || return 1
+  case $loader in
+    '\EFI\BOOT\BOOTX64.EFI'|'\EFI\BOOT\BOOTIA32.EFI'|'\EFI\BOOT\BOOTAA64.EFI') ;;
+    *) return 1 ;;
+  esac
+  slen=${#serial}
+  llen=${#loader}
+  wwid_len=$((10 + slen * 2))
+  file_len=$((4 + (llen + 1) * 2))
+  path_len=$((wwid_len + file_len + 4))
+  (( path_len <= 512 )) || return 1
+  printf '\001\000\000\000' || return 1
+  le16 "$path_len" || return 1
+  utf16_ascii "Reboot into USB" || return 1
+  printf '\0\0' || return 1
+  printf '\003\020' || return 1
+  le16 "$wwid_len" || return 1
+  le16 "$ifn" || return 1
+  le16 "$vn" || return 1
+  le16 "$pn" || return 1
+  utf16_ascii "$serial" || return 1
+  printf '\004\004' || return 1
+  le16 "$file_len" || return 1
+  utf16_ascii "$loader" || return 1
+  printf '\0\0' || return 1
+  printf '\177\377\004\000' || return 1
+}
+
+boot_var_name() {
+  local id=$1
+  [[ $id =~ ^[0-9A-F]{4}$ ]] || return 1
+  printf '%s-Boot%s\n' "$EFI_GUID" "$id"
+}
+
+# One sysfs line, capped. The file must be a regular file under /sys/devices.
+read_sysfs_line() {
+  local file=$1 max=$2 out
+  [[ $file == /sys/devices/* && $file != *..* ]] || return 1
+  [[ -f $file && ! -L $file ]] || return 1
+  trusted_executable "$HEAD" || return 1
+  out=$(LC_ALL=C "$HEAD" -c $((max + 1)) -- "$file") || return 1
+  [[ ${#out} -le $max ]] || return 1
+  out=${out%$'\n'}
+  [[ $out != *$'\n'* ]] || return 1
+  printf '%s' "$out"
+}
+
+# Vendor, product, and interface for this disk. The USB device directory's
+# serial has to match the lsblk serial, so a walk that reaches the root hub
+# is rejected. Prints three hex fields.
+usb_identity() {
+  local disk=$1 expect=$2 name link resolved dir base steps=0
+  local vendor product serial rest iface ifnum
+  [[ $expect =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,64}$ ]] || return 1
+  name=${disk#/dev/}
+  [[ $name =~ ^(sd[a-z]|nvme[0-9]+n[0-9]+)$ ]] || return 1
+  link="/sys/block/${name}/device"
+  [[ -L $link ]] || return 1
+  trusted_executable "$READLINK" || return 1
+  resolved=$("$READLINK" -f -- "$link") || return 1
+  [[ $resolved =~ ^/sys/devices/[A-Za-z0-9_.:/-]+$ ]] || return 1
+  dir=$resolved
+  while [[ $dir == /sys/devices/* && $dir != /sys/devices && $steps -lt 12 ]]; do
+    base=${dir##*/}
+    if [[ $base =~ ^[0-9]+-[0-9.]+$ ]]; then
+      vendor=$(read_sysfs_line "$dir/idVendor" 8) || return 1
+      product=$(read_sysfs_line "$dir/idProduct" 8) || return 1
+      serial=$(read_sysfs_line "$dir/serial" 80) || return 1
+      [[ $vendor =~ ^[0-9A-Fa-f]{4}$ && $product =~ ^[0-9A-Fa-f]{4}$ ]] || return 1
+      [[ $serial == "$expect" ]] || return 1
+      rest=${resolved#"$dir"/}
+      iface=${rest%%/*}
+      [[ $iface =~ ^[0-9]+-[0-9.]+:[0-9.]+$ ]] || return 1
+      [[ -d $dir/$iface && ! -L $dir/$iface ]] || return 1
+      ifnum=$(read_sysfs_line "$dir/$iface/bInterfaceNumber" 8) || return 1
+      [[ $ifnum =~ ^[0-9A-Fa-f]{2}$ ]] || return 1
+      printf '%s %s %s\n' "$vendor" "$product" "$ifnum"
+      return 0
+    fi
+    dir=${dir%/*}
+    steps=$((steps + 1))
+  done
+  return 1
+}
+
+# Fixture rows carry the ids. A live disk is read from sysfs at commit time.
+load_usb_ids() {
+  local drive=$1 disk=$2 serial=$3 ident vendor product iface
+  if [[ -n ${USB_FIXTURE:-} ]]; then
+    vendor=$(jq -r '.usbVendor // ""' <<<"$drive")
+    product=$(jq -r '.usbProduct // ""' <<<"$drive")
+    iface=$(jq -r '.usbInterface // ""' <<<"$drive")
+  else
+    ident=$(usb_identity "$disk" "$serial") || return 1
+    vendor=${ident%% *}
+    ident=${ident#* }
+    product=${ident%% *}
+    iface=${ident#* }
+  fi
+  [[ $vendor =~ ^[0-9A-Fa-f]{4}$ ]] || return 1
+  [[ $product =~ ^[0-9A-Fa-f]{4}$ ]] || return 1
+  [[ $iface =~ ^[0-9A-Fa-f]{2}$ ]] || return 1
+  [[ $serial =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,64}$ ]] || return 1
+  USB_VENDOR=$vendor
+  USB_PRODUCT=$product
+  USB_IFACE=$iface
+  USB_VENDOR_N=$((16#$vendor))
+  USB_PRODUCT_N=$((16#$product))
+  USB_IFACE_N=$((16#$iface))
+}
+
+file_sha() {
+  local path=$1 sum
+  trusted_executable "$SHA256" || return 1
+  sum=$("$SHA256" -- "$path") || return 1
+  sum=${sum%% *}
+  [[ $sum =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$sum"
+}
+
+# Close the sealed load option and the helper that handed it over.
+# Only fds bash allocated above the standard streams are closed.
+release_holder() {
+  if [[ ${LOADOPT_FD:-} =~ ^[0-9]+$ ]] && (( LOADOPT_FD >= 10 )) && [[ -e /proc/$$/fd/$LOADOPT_FD ]]; then
+    exec {LOADOPT_FD}>&- || true
+  fi
+  LOADOPT_FD=""
+  if [[ ${LOADOPT_IN:-} =~ ^[0-9]+$ ]] && (( LOADOPT_IN >= 10 )) && [[ -e /proc/$$/fd/$LOADOPT_IN ]]; then
+    printf x >&"${LOADOPT_IN}" || true
+    exec {LOADOPT_IN}>&- || true
+  fi
+  LOADOPT_IN=""
+  if [[ ${LOADOPT_PID:-} =~ ^[0-9]+$ ]]; then
+    wait "$LOADOPT_PID" 2>/dev/null || true
+  fi
+  LOADOPT_PID=""
+  SEALED_PATH=""
+}
+
+# Build the load option and hold it in a sealed memfd owned by this shell.
+# The root helper reads those bytes on its standard input. A path is not
+# passed across pkexec, and the bytes are not a file in /tmp. The seal stops
+# writes, and the fd stays open until the elevated command returns.
+# Sets SEALED_PATH and LOADOPT_FD. The caller closes them with release_holder.
+seal_load_option() {
+  local vn=$1 pn=$2 ifn=$3 serial=$4 loader=$5
+  local size sum_emit sum_fd line py_pid py_fd out_fd data_path
+  trusted_executable "$PYTHON" || return 1
+  trusted_executable "$WC" || return 1
+  size=$(emit_load_option "$vn" "$pn" "$ifn" "$serial" "$loader" | "$WC" -c) || return 1
+  size=${size//[[:space:]]/}
+  [[ $size =~ ^[0-9]+$ ]] || return 1
+  (( size >= 16 && size <= 512 )) || return 1
+  trusted_executable "$SHA256" || return 1
+  sum_emit=$(emit_load_option "$vn" "$pn" "$ifn" "$serial" "$loader" | "$SHA256") || return 1
+  sum_emit=${sum_emit%% *}
+  [[ $sum_emit =~ ^[0-9a-f]{64}$ ]] || return 1
+  coproc HOLDER {
+    exec "$PYTHON" -I -S -c '
+import fcntl, os, sys
+line = sys.stdin.buffer.readline()
+if not line:
+    sys.exit(2)
+n = int(line)
+if n < 16 or n > 512:
+    sys.exit(2)
+data = sys.stdin.buffer.read(n)
+if len(data) != n:
+    sys.exit(2)
+fd = os.memfd_create("loadopt", os.MFD_ALLOW_SEALING)
+if os.write(fd, data) != n:
+    sys.exit(2)
+os.lseek(fd, 0, os.SEEK_SET)
+seals = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL
+fcntl.fcntl(fd, fcntl.F_ADD_SEALS, seals)
+sys.stdout.write("%s %s\n" % (os.getpid(), fd))
+sys.stdout.flush()
+sys.stdin.buffer.read(1)
+'
+  }
+  LOADOPT_PID=${HOLDER_PID:-}
+  [[ $LOADOPT_PID =~ ^[0-9]+$ ]] || return 1
+  out_fd=${HOLDER[0]}
+  LOADOPT_IN=${HOLDER[1]}
+  printf '%s\n' "$size" >&"$LOADOPT_IN" || return 1
+  emit_load_option "$vn" "$pn" "$ifn" "$serial" "$loader" >&"$LOADOPT_IN" || return 1
+  IFS=' ' read -r -t 5 py_pid py_fd <&"$out_fd" || return 1
+  if [[ $out_fd =~ ^[0-9]+$ ]] && (( out_fd >= 10 )); then
+    exec {out_fd}>&- 2>/dev/null || true
+  fi
+  [[ $py_pid == "$LOADOPT_PID" && $py_fd =~ ^[0-9]+$ ]] || return 1
+  data_path="/proc/${py_pid}/fd/${py_fd}"
+  [[ -L $data_path ]] || return 1
+  sum_fd=$(file_sha "$data_path") || return 1
+  [[ $sum_fd == "$sum_emit" ]] || return 1
+  exec {LOADOPT_FD}<"$data_path" || return 1
+  SEALED_PATH="/proc/$$/fd/${LOADOPT_FD}"
+  sum_fd=$(file_sha "$SEALED_PATH") || return 1
+  [[ $sum_fd == "$sum_emit" ]] || return 1
+  if [[ ${LOADOPT_IN:-} =~ ^[0-9]+$ ]] && (( LOADOPT_IN >= 10 )) && [[ -e /proc/$$/fd/$LOADOPT_IN ]]; then
+    printf x >&"${LOADOPT_IN}" || true
+    exec {LOADOPT_IN}>&- || true
+    LOADOPT_IN=""
+  fi
+  if [[ ${LOADOPT_PID:-} =~ ^[0-9]+$ ]]; then
+    wait "$LOADOPT_PID" 2>/dev/null || true
+    LOADOPT_PID=""
+  fi
+  [[ -L $SEALED_PATH ]] || return 1
+  sum_fd=$(file_sha "$SEALED_PATH") || return 1
+  [[ $sum_fd == "$sum_emit" ]] || return 1
+}
+
+# Root via passwordless sudo when the machine offers it, otherwise the
+# session polkit agent. The elevated program is a pinned system binary.
+# pkexec treats a leading -- as the program name, so the binary is the
+# first argument.
+priv_exec() {
+  local bin=$1
+  shift
+  if ! trusted_executable "$bin"; then
+    CAP_STATUS=127
+    CAP_OUT=""
+    CAP_ERR="not installed"
+    return
+  fi
+  if [[ $(id -u) -eq 0 ]]; then
+    capture "$bin" "$@"
+    return
+  fi
+  if trusted_executable "$SUDO" && "$SUDO" -n /usr/bin/true >/dev/null 2>&1; then
+    capture "$SUDO" -n -- "$bin" "$@"
+    return
+  fi
+  if ! trusted_executable "$PKEXEC"; then
+    CAP_STATUS=127
+    CAP_OUT=""
+    CAP_ERR="pkexec was not found"
+    return
+  fi
+  capture "$PKEXEC" "$bin" "$@"
+}
+
+stale_owned_ids() {
+  local keep=$1
+  jq -r --arg keep "$keep" '
+    .entries[] | select(.owned == true and .inOrder != true and .id != $keep) | .id
+  ' <<<"$PARSED"
+}
+
+# Ids the root helper may remove. Each one is owned and not in BootOrder.
+# Eight is the same cap as the USB list. More than that stops the arm.
+collect_stale() {
+  local keep=$1 id
+  STALE_IDS=()
+  while IFS= read -r id; do
+    [[ -n $id ]] || continue
+    [[ $id =~ ^[0-9A-F]{4}$ ]] || return 1
+    [[ -n $keep && $id == "$keep" ]] && continue
+    (( ${#STALE_IDS[@]} < 8 )) || return 1
+    STALE_IDS+=("$id")
+  done < <(stale_owned_ids "$keep")
+}
+
+# The installed helper must be the root-owned file, and its bytes must match
+# the copy shipped with this plugin. A mismatch refuses rather than running
+# a different program. This does not install or replace that file.
+require_arm() {
+  local src path sum_src sum_ins
+  trusted_executable "$ARM_USB" || fail "The USB boot helper is not installed"
+  path=$("$READLINK" -f -- "$0") || fail "The USB boot helper is not installed"
+  [[ $path == /*/target-boot ]] || fail "The USB boot helper is not installed"
+  src=${path%/*}/arm-usb
+  [[ -f $src && ! -L $src ]] || fail "The USB boot helper is not installed"
+  trusted_executable "$SHA256" || fail "The USB boot helper is not installed"
+  sum_src=$("$SHA256" -- "$src") || fail "The USB boot helper is not installed"
+  sum_ins=$("$SHA256" -- "$ARM_USB") || fail "The USB boot helper is not installed"
+  sum_src=${sum_src%% *}
+  sum_ins=${sum_ins%% *}
+  [[ $sum_src =~ ^[0-9a-f]{64}$ && $sum_src == "$sum_ins" ]] || fail "The USB boot helper does not match this plugin"
+}
+
+# An entry this plugin already wrote for this stick. The firmware's text
+# view drops the last character of the serial, so the match uses the rest.
+# A short fragment is not used, so an unrelated entry cannot match.
+owned_for_serial() {
+  local serial=$1 snip
+  [[ $serial =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,64}$ ]] || return 1
+  [[ ${#serial} -ge 9 ]] || return 1
+  snip=${serial:0:${#serial}-1}
+  [[ ${#snip} -ge 8 ]] || return 1
+  jq -r --arg snip "$snip" '
+    [ .entries[] | select(.owned == true and (.path | contains($snip))) | .id ]
+    | if length == 1 then .[0] else empty end
+  ' <<<"$PARSED"
+}
+
+# key is the only value the panel sends. Disk, partition, and loader come
+# from a fresh scan, and the loader has to be one of the fallback paths.
+arm_usb() {
+  local key=$1 dry=$2 do_reboot=$3
+  local spec drive disk part loader loader_name partuuid serial
+  local existing="" free="" id="" before argv cleanup reboot
+  local hex=""
+  local -a STALE_IDS=()
+  if [[ $dry -eq 0 ]]; then
+    refuse_fixture_write 0
+    if [[ -n ${USB_FIXTURE:-} ]]; then
+      fail "A fixture cannot be used when writing firmware"
+    fi
+  fi
+  [[ $key =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$ ]] || fail "That USB drive is not available"
+  if [[ -n ${USB_FIXTURE:-} ]]; then
+    spec=$(read_usb_fixture) || fail "Could not read the USB fixture"
+  else
+    spec=$(scan_usb) || fail "Could not look at USB drives"
+  fi
+  drive=$(jq -c --arg key "$key" 'first(.[] | select(.key == $key)) // empty' <<<"$spec") || drive=""
+  [[ -n $drive ]] || fail "That USB drive is not available"
+  disk=$(jq -r '.disk' <<<"$drive")
+  part=$(jq -r '.part | tostring' <<<"$drive")
+  loader=$(jq -r '.loader' <<<"$drive")
+  loader_name=$(jq -r '.loaderName' <<<"$drive")
+  partuuid=$(jq -r '.partuuid // ""' <<<"$drive")
+  serial=$(jq -r '.serial // ""' <<<"$drive")
+  usb_disk_path "$disk" || fail "That USB drive is not available"
+  [[ $part =~ ^(0|[1-9][0-9]?)$ ]] || fail "That USB drive is not available"
+  case $loader in
+    '\EFI\BOOT\BOOTX64.EFI'|'\EFI\BOOT\BOOTIA32.EFI'|'\EFI\BOOT\BOOTAA64.EFI') ;;
+    *) fail "That USB drive is not available" ;;
+  esac
+  case $loader_name in
+    BOOTX64.EFI|BOOTIA32.EFI|BOOTAA64.EFI) ;;
+    *) fail "That USB drive is not available" ;;
+  esac
+  [[ $partuuid =~ ^[0-9A-Fa-f-]{0,64}$ ]] || fail "That USB drive is not available"
+
+  load_firmware || { printf '%s\n' "$PARSED"; exit 1; }
+  before=$(order_csv)
+  BEFORE_ORDER=$before
+  if [[ -n $partuuid ]]; then
+    existing=$(jq -r --arg uuid "$partuuid" --arg file "$loader_name" '
+      first(.entries[]
+        | select(
+            ((.file | ascii_downcase | gsub("/"; "\\") | split("\\") | last) == ($file | ascii_downcase))
+            and ((.path | ascii_downcase) | contains($uuid | ascii_downcase)))
+        | .id) // ""
+    ' <<<"$PARSED")
+  fi
+  [[ -z $existing || $existing =~ ^[0-9A-F]{4}$ ]] || existing=""
+  # A partitionless stick reuses the one entry this plugin already wrote for
+  # that serial. Creating another would be a second firmware variable, and
+  # another password prompt.
+  if [[ -z $existing && $part == 0 ]]; then
+    existing=$(owned_for_serial "$serial") || existing=""
+    [[ $existing =~ ^[0-9A-F]{4}$ ]] || existing=""
+  fi
+
+  if [[ $dry -eq 1 ]]; then
+    if [[ -n $existing ]]; then
+      argv=$(json_argv "$EFIBOOTMGR" --bootnext "$existing")
+    elif [[ $part == 0 ]]; then
+      free=$(next_free_id) || fail "There is no free boot id"
+      load_usb_ids "$drive" "$disk" "$serial" || fail "Could not identify that USB drive, so next boot was not set"
+      seal_load_option "$USB_VENDOR_N" "$USB_PRODUCT_N" "$USB_IFACE_N" "$serial" "$loader" \
+        || fail "Could not prepare the USB boot entry"
+      release_holder
+      trusted_executable "$OD" || fail "Could not prepare the USB boot entry"
+      trusted_executable "$TR" || fail "Could not prepare the USB boot entry"
+      hex=$(emit_load_option "$USB_VENDOR_N" "$USB_PRODUCT_N" "$USB_IFACE_N" "$serial" "$loader" | "$OD" -An -tx1 | "$TR" -d ' \n') \
+        || fail "Could not prepare the USB boot entry"
+      [[ $hex =~ ^[0-9a-f]+$ ]] || fail "Could not prepare the USB boot entry"
+      collect_stale "$free" || fail "Could not prepare the USB boot entry"
+      argv=$(json_argv "$ARM_USB" "$free" "${STALE_IDS[@]}")
+    else
+      free=$(next_free_id) || fail "There is no free boot id"
+      argv=$(json_argv "$EFIBOOTMGR" --create-only --bootnum "$free" --disk "$disk" --part "$part" --label "$USB_LABEL" --loader "$loader" --bootnext "$free")
+    fi
+    cleanup=$(jq -c --arg keep "$existing" '
+      [ .entries[] | select(.owned == true and .inOrder != true and .id != $keep) | .id ]
+    ' <<<"$PARSED")
+    if [[ $do_reboot -eq 1 ]]; then
+      reboot_command
+      reboot=$(json_argv "${REBOOT_CMD[@]}")
+      if [[ $part == 0 && -z $existing ]]; then
+        jq -cn --arg key "$key" --argjson argv "$argv" --arg hex "$hex" \
+          --argjson cleanup "$cleanup" --argjson reboot "$reboot" \
+          '{ok:true, dryRun:true, action:"reboot-into-usb", key:$key, argv:$argv, loadOption:$hex, cleanup:$cleanup, reboot:$reboot}'
+      else
+        jq -cn --arg key "$key" --argjson argv "$argv" --argjson cleanup "$cleanup" --argjson reboot "$reboot" \
+          '{ok:true, dryRun:true, action:"reboot-into-usb", key:$key, argv:$argv, cleanup:$cleanup, reboot:$reboot}'
+      fi
+    elif [[ $part == 0 && -z $existing ]]; then
+      jq -cn --arg key "$key" --argjson argv "$argv" --arg hex "$hex" --argjson cleanup "$cleanup" \
+        '{ok:true, dryRun:true, action:"bootnext-usb", key:$key, argv:$argv, loadOption:$hex, cleanup:$cleanup}'
+    else
+      jq -cn --arg key "$key" --argjson argv "$argv" --argjson cleanup "$cleanup" \
+        '{ok:true, dryRun:true, action:"bootnext-usb", key:$key, argv:$argv, cleanup:$cleanup}'
+    fi
+    return
+  fi
+
+  usb_still_present "$disk" "$serial" || fail "That USB drive is not available"
+  if [[ -n $existing ]]; then
+    delete_stale_owned "$existing"
+    id=$existing
+    efi_exec --bootnext "$id"
+  elif [[ $part == 0 ]]; then
+    require_arm
+    free=$(next_free_id) || fail "There is no free boot id"
+    id=$free
+    load_usb_ids "$drive" "$disk" "$serial" || fail "Could not identify that USB drive, so next boot was not set"
+    collect_stale "$id" || fail "Could not prepare the USB boot entry"
+    seal_load_option "$USB_VENDOR_N" "$USB_PRODUCT_N" "$USB_IFACE_N" "$serial" "$loader" \
+      || fail "Could not prepare the USB boot entry"
+    [[ $SEALED_PATH =~ ^/proc/[0-9]+/fd/[0-9]+$ ]] || fail "Could not prepare the USB boot entry"
+    [[ ${LOADOPT_FD:-} =~ ^[0-9]+$ ]] || fail "Could not prepare the USB boot entry"
+    # The held descriptor is the helper's standard input. release_holder
+    # waits until priv_exec returns, so the memfd stays alive for that read.
+    CAPTURE_FD=$LOADOPT_FD
+    priv_exec "$ARM_USB" "$id" "${STALE_IDS[@]}"
+    CAPTURE_FD=""
+    release_holder
+    if [[ ${CAP_STATUS:-1} -ne 0 ]]; then
+      load_firmware || fail "Could not read the EFI boot entries"
+      if [[ $(order_csv) != "$before" ]]; then
+        fail "The firmware boot order changed, so the reboot was not started"
+      fi
+      auth_failure "set next boot"
+    fi
+  else
+    delete_stale_owned "$existing"
+    free=$(next_free_id) || fail "There is no free boot id"
+    id=$free
+    efi_exec --create-only --bootnum "$id" --disk "$disk" --part "$part" --label "$USB_LABEL" --loader "$loader" --bootnext "$id"
+  fi
+  if [[ ${CAP_STATUS:-1} -ne 0 ]]; then
+    auth_failure "set next boot"
+  fi
+
+  load_firmware || { printf '%s\n' "$PARSED"; exit 1; }
+  local after next
+  after=$(order_csv)
+  next=$(boot_next_value)
+  if [[ $before != "$after" ]]; then
+    fail "The firmware boot order changed, so the reboot was not started"
+  fi
+  if [[ $next != "$id" ]]; then
+    fail "Next boot did not stick, so the reboot was not started"
+  fi
+  if ! jq -e --arg id "$id" 'any(.entries[]; .id == $id)' <<<"$PARSED" >/dev/null; then
+    fail "Next boot did not stick, so the reboot was not started"
+  fi
+
+  if [[ $do_reboot -eq 0 ]]; then
+    jq -cn --arg id "$id" --arg key "$key" '{ok:true, action:"bootnext-usb", id:$id, key:$key, bootNext:$id}'
+    return
+  fi
+
+  reboot_command
+  capture "${REBOOT_CMD[@]}"
+  if [[ ${CAP_STATUS:-1} -ne 0 ]]; then
+    local detail
+    detail=$(efi_detail)
+    if [[ -n $detail ]]; then
+      fail "Next boot is set to ${id}, and the reboot did not start. ${detail}"
+    fi
+    fail "Next boot is set to ${id}, and the reboot did not start"
+  fi
+  jq -cn --arg id "$id" --arg key "$key" '{ok:true, action:"reboot-into-usb", id:$id, key:$key, bootNext:$id}'
+}
+
 sanitize_environment "$@"
+trap release_holder EXIT
 
 if ! trusted_executable "$JQ"; then
   printf '%s\n' '{"ok":false,"error":"jq is not installed"}'
@@ -573,6 +1539,7 @@ if ! trusted_executable "$JQ"; then
 fi
 
 FIXTURE=""
+USB_FIXTURE=""
 DRY=0
 POSITIONAL=()
 
@@ -589,6 +1556,11 @@ while (($# > 0)); do
     --fixture)
       [[ -n ${2:-} ]] || fail "Pass a file after --fixture"
       FIXTURE=$2
+      shift 2
+      ;;
+    --usb-fixture)
+      [[ -n ${2:-} ]] || fail "Pass a file after --usb-fixture"
+      USB_FIXTURE=$2
       shift 2
       ;;
     --dry-run)
@@ -628,9 +1600,17 @@ case "$cmd" in
     [[ ${#POSITIONAL[@]} -eq 2 ]] || fail "reboot-into takes the four digit boot id"
     cmd_reboot_into "$DRY" "${POSITIONAL[1]}"
     ;;
+  bootnext-usb)
+    [[ ${#POSITIONAL[@]} -eq 2 ]] || fail "bootnext-usb takes the drive key"
+    arm_usb "${POSITIONAL[1]}" "$DRY" 0
+    ;;
+  reboot-into-usb)
+    [[ ${#POSITIONAL[@]} -eq 2 ]] || fail "reboot-into-usb takes the drive key"
+    arm_usb "${POSITIONAL[1]}" "$DRY" 1
+    ;;
   "")
     usage >&2
-    fail "Choose list, bootnext, clear-next, or reboot-into"
+    fail "Choose list, bootnext, clear-next, reboot-into, bootnext-usb, or reboot-into-usb"
     ;;
   *)
     fail "Unknown command: $cmd"

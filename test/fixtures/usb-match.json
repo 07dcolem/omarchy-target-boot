@@ -1,0 +1,14 @@
+[
+  {
+    "key": "MATCHSTICK-2",
+    "label": "VENTOY",
+    "size": "57G",
+    "loader": "\\EFI\\BOOT\\BOOTX64.EFI",
+    "loaderName": "BOOTX64.EFI",
+    "disk": "/dev/sdy",
+    "part": 2,
+    "partuuid": "0a8bf0ff-1cba-46c1-8769-bc6557984e51",
+    "model": "SanDisk",
+    "serial": "MATCHSTICK"
+  }
+]

@@ -1,0 +1,14 @@
+[
+  {
+    "key": "ABCD1234-1",
+    "label": "DVD_ROM",
+    "size": "28.7G",
+    "loader": "\\EFI\\BOOT\\BOOTX64.EFI",
+    "loaderName": "BOOTX64.EFI",
+    "disk": "/dev/sdz",
+    "part": 1,
+    "partuuid": "",
+    "model": "SanDisk Cruzer",
+    "serial": "ABCD1234"
+  }
+]
