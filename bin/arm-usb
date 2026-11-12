@@ -255,15 +255,28 @@ def read_stdin_option():
     return blob
 
 
-def write_option(boot_id, blob):
-    handle = os.memfd_create("loadopt", 0)
+def open_load_option(blob):
+    """A sealed memfd. Flags 0 cannot be sealed, and efivar then never runs."""
+    handle = os.memfd_create("loadopt", os.MFD_ALLOW_SEALING | os.MFD_CLOEXEC)
     try:
         if os.write(handle, blob) != len(blob):
             die("The load option could not be read")
         os.lseek(handle, 0, os.SEEK_SET)
         seals = (fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SHRINK
                  | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL)
-        fcntl.fcntl(handle, fcntl.F_ADD_SEALS, seals)
+        try:
+            fcntl.fcntl(handle, fcntl.F_ADD_SEALS, seals)
+        except OSError:
+            die("Could not prepare the USB boot entry")
+    except BaseException:
+        os.close(handle)
+        raise
+    return handle
+
+
+def write_option(boot_id, blob):
+    handle = open_load_option(blob)
+    try:
         path = "/proc/%d/fd/%d" % (os.getpid(), handle)
         done = run([
             VAR, "--name", "%s-Boot%s" % (GUID, boot_id),

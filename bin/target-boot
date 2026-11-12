@@ -1482,10 +1482,18 @@ arm_usb() {
     CAPTURE_FD=""
     release_holder
     if [[ ${CAP_STATUS:-1} -ne 0 ]]; then
+      # load_firmware replaces this capture with a successful listing.
+      # That listing is not the helper's error.
+      local arm_status arm_detail
+      arm_status=$CAP_STATUS
+      arm_detail=$(efi_detail)
       load_firmware || fail "Could not read the EFI boot entries"
       if [[ $(order_csv) != "$before" ]]; then
         fail "The firmware boot order changed, so the reboot was not started"
       fi
+      CAP_STATUS=$arm_status
+      CAP_ERR=$arm_detail
+      CAP_OUT=""
       auth_failure "set next boot"
     fi
   else

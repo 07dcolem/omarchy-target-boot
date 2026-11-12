@@ -316,7 +316,7 @@ grep -q 'SEALED_PATH="/proc/$$/fd/${LOADOPT_FD}"' "$cli"
 grep -q '/usr/local/libexec/io.github.07dcolem.target-boot/arm-usb' "$cli"
 grep -q '/usr/local/libexec/io.github.07dcolem.target-boot/arm-usb' "$root/bin/arm-usb"
 grep -q -- '"--write", "--datafile"' "$root/bin/arm-usb"
-grep -q 'memfd_create("loadopt"' "$root/bin/arm-usb"
+grep -q 'memfd_create("loadopt", os.MFD_ALLOW_SEALING | os.MFD_CLOEXEC)' "$root/bin/arm-usb"
 grep -q 'sys.stdin.buffer.read(513)' "$root/bin/arm-usb"
 if grep -n 'priv_exec "$ARM_USB".*\(data_path\|SEALED_PATH\)' "$cli"; then
   echo "the load option path would be an argument of the root helper" >&2
@@ -345,7 +345,11 @@ if grep -n -E 'bash[[:space:]]+-c|sh[[:space:]]+-c' "$cli" "$root/bin/arm-usb"; 
 fi
 python3 -I -S - "$root/bin/arm-usb" <<'PY'
 import contextlib
+import fcntl
 import io
+import mmap
+import os
+import subprocess
 import sys
 import time
 path = sys.argv[1]
@@ -373,6 +377,31 @@ started = time.monotonic()
 expect_stop(["/usr/bin/sleep", "30"])
 if time.monotonic() - started > 12:
     sys.exit("the deadline was longer than 12 seconds")
+
+# efivar mmaps --datafile. A memfd created with flags 0 rejects the seal,
+# so the helper must allow sealing or the write never starts.
+blob = b"sealed-load-option"
+fd = ns["open_load_option"](blob)
+try:
+    seals = fcntl.fcntl(fd, fcntl.F_GET_SEALS)
+    needed = (fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SHRINK
+              | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL)
+    if (seals & needed) != needed:
+        sys.exit("the load option was not sealed")
+    path = "/proc/%d/fd/%d" % (os.getpid(), fd)
+    child = subprocess.run(
+        ["/usr/bin/python3", "-I", "-S", "-c",
+         "import mmap, os, sys\n"
+         "raw = os.open(sys.argv[1], os.O_RDONLY)\n"
+         "size = os.fstat(raw).st_size\n"
+         "view = mmap.mmap(raw, size, mmap.MAP_PRIVATE | mmap.MAP_POPULATE, mmap.PROT_READ)\n"
+         "sys.stdout.buffer.write(view[:])\n",
+         path],
+        check=False, capture_output=True)
+    if child.returncode != 0 or child.stdout != blob:
+        sys.exit("efivar could not map the sealed load option")
+finally:
+    os.close(fd)
 PY
 if grep -n -E -- '--bootorder|bootctl|set-default|(^|[^[:alnum:]_-])--create([^[:alnum:]_-]|$)|--append|--import|--export|--attributes' "$root/bin/arm-usb"; then
   echo "the USB helper has a forbidden firmware operation" >&2
