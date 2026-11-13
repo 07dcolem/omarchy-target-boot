@@ -38,6 +38,21 @@ Panel {
   // The helper caps its own output. This ceiling is the shell-side stop,
   // measured in UTF-16 units, so a runaway child cannot fill the process.
   readonly property int outputCap: 262144
+  // List is unprivileged. Reboot and clear wait for the password prompt.
+  readonly property int listDeadlineMs: Model.listDeadlineMs()
+  readonly property int actionDeadlineMs: Model.actionDeadlineMs()
+  property int listGen: 0
+  property int actionGen: 0
+  property int clearGen: 0
+  property int listStartedGen: -1
+  property int actionStartedGen: -1
+  property int clearStartedGen: -1
+  property int listRunningGen: -1
+  property int actionRunningGen: -1
+  property int clearRunningGen: -1
+  property int listSettledGen: -1
+  property int actionSettledGen: -1
+  property int clearSettledGen: -1
   property string listBuf: ""
   property string actionBuf: ""
   property string clearBuf: ""
@@ -152,6 +167,12 @@ Panel {
   implicitHeight: bar && bar.vertical ? barSlot : (bar ? bar.barSize : Style.bar.sizeHorizontal)
 
   function refresh() {
+    listGen += 1
+    listDeadline.stop()
+    listBuf = ""
+    listUsed = 0
+    listOverflow = false
+    listKill.stop()
     listProc.running = false
     listProc.command = [cli, "list"]
     listProc.running = true
@@ -451,6 +472,12 @@ Panel {
     if (busy || committed || departingId === "") return
     countdownTimer.stop()
     busy = true
+    actionGen += 1
+    actionDeadline.stop()
+    actionBuf = ""
+    actionUsed = 0
+    actionOverflow = false
+    actionKill.stop()
     actionProc.running = false
     actionProc.command = departingUsb
       ? [cli, "reboot-into-usb", departingId]
@@ -477,6 +504,12 @@ Panel {
   function clearNext() {
     if (busy || committed) return
     busy = true
+    clearGen += 1
+    clearDeadline.stop()
+    clearBuf = ""
+    clearUsed = 0
+    clearOverflow = false
+    clearKill.stop()
     clearProc.running = false
     clearProc.command = [cli, "clear-next"]
     clearProc.running = true
@@ -689,6 +722,9 @@ Panel {
     if (!committed) cancelDeparture()
   }
   Component.onCompleted: refresh()
+  // TERM asks the script to reap its group. Quickshell then SIGKILLs the
+  // script, and each child is tied to that process so it dies with it.
+  // The escalation timers die with this panel, so they are not the cleanup.
   Component.onDestruction: {
     if (listProc.running) listProc.signal(15)
     if (actionProc.running) actionProc.signal(15)
@@ -887,9 +923,86 @@ Panel {
     return overflow ? "" : text
   }
 
+  function noteStop(which) {
+    if (which !== "list" && which !== "action" && which !== "clear") return
+    var proc = which === "action" ? actionProc : which === "clear" ? clearProc : listProc
+    var gen = which === "action" ? actionGen : which === "clear" ? clearGen : listGen
+    if (gen === 0) return
+    var startedGen = which === "action" ? actionStartedGen : which === "clear" ? clearStartedGen : listStartedGen
+    var settledGen = which === "action" ? actionSettledGen : which === "clear" ? clearSettledGen : listSettledGen
+    if (Model.processStop(proc.running, gen, startedGen, settledGen) !== "failed-start") return
+    Qt.callLater(function() {
+      if (which === "action" && gen !== root.actionGen) return
+      if (which === "clear" && gen !== root.clearGen) return
+      if (which === "list" && gen !== root.listGen) return
+      var current = which === "action" ? actionProc : which === "clear" ? clearProc : listProc
+      var startedNow = which === "action" ? actionStartedGen : which === "clear" ? clearStartedGen : listStartedGen
+      var settledNow = which === "action" ? actionSettledGen : which === "clear" ? clearSettledGen : listSettledGen
+      if (Model.processStop(current.running, gen, startedNow, settledNow) !== "failed-start") return
+      root.failStart(which)
+    })
+  }
+
+  function failStart(which) {
+    if (which === "list") {
+      if (listSettledGen === listGen) return
+      listSettledGen = listGen
+      listDeadline.stop()
+      applyList(1, "{\"ok\":false,\"error\":\"The boot menu did not start\"}")
+      return
+    }
+    if (which === "action") {
+      if (actionSettledGen === actionGen) return
+      actionSettledGen = actionGen
+      actionDeadline.stop()
+      finishAction(1, "{\"ok\":false,\"error\":\"The reboot helper did not start\"}")
+      return
+    }
+    if (clearSettledGen === clearGen) return
+    clearSettledGen = clearGen
+    clearDeadline.stop()
+    busy = false
+    errorText = "Could not clear next boot"
+  }
+
+  function expireProcess(which) {
+    var proc = which === "action" ? actionProc : which === "clear" ? clearProc : listProc
+    var timer = which === "action" ? actionKill : which === "clear" ? clearKill : listKill
+    var gen = which === "action" ? actionGen : which === "clear" ? clearGen : listGen
+    var settled = which === "action" ? actionSettledGen : which === "clear" ? clearSettledGen : listSettledGen
+    if (gen === 0 || settled === gen) return
+    if (which === "action") { actionSettledGen = gen; actionDeadline.stop() }
+    else if (which === "clear") { clearSettledGen = gen; clearDeadline.stop() }
+    else { listSettledGen = gen; listDeadline.stop() }
+    if (proc.running) proc.signal(15)
+    timer.restart()
+    if (which === "list") {
+      applyList(1, "{\"ok\":false,\"error\":\"Reading the boot menu timed out\"}")
+      return
+    }
+    if (which === "action") {
+      busy = false
+      committed = false
+      departing = false
+      resetCountVisual()
+      holdError = true
+      errorText = "Next boot timed out"
+      if (!opened) open()
+      refresh()
+      return
+    }
+    busy = false
+    holdError = true
+    errorText = "Clearing next boot timed out"
+    refresh()
+  }
+
   Timer { id: listKill; interval: 2000; repeat: false; onTriggered: if (listProc.running) listProc.signal(9) }
   Timer { id: actionKill; interval: 2000; repeat: false; onTriggered: if (actionProc.running) actionProc.signal(9) }
   Timer { id: clearKill; interval: 2000; repeat: false; onTriggered: if (clearProc.running) clearProc.signal(9) }
+  Timer { id: listDeadline; interval: root.listDeadlineMs; repeat: false; onTriggered: root.expireProcess("list") }
+  Timer { id: actionDeadline; interval: root.actionDeadlineMs; repeat: false; onTriggered: root.expireProcess("action") }
+  Timer { id: clearDeadline; interval: root.actionDeadlineMs; repeat: false; onTriggered: root.expireProcess("clear") }
 
   Process {
     id: listProc
@@ -897,24 +1010,51 @@ Panel {
     environment: root.sessionEnvironment
     stdout: SplitParser { splitMarker: ""; onRead: function(data) { root.noteStream("list", data, true) } }
     stderr: SplitParser { splitMarker: ""; onRead: function(data) { root.noteStream("list", data, false) } }
+    onStarted: {
+      root.listStartedGen = root.listGen
+      root.listRunningGen = root.listGen
+      listDeadline.restart()
+    }
+    onRunningChanged: root.noteStop("list")
     onExited: function(code) {
+      var gen = root.listRunningGen
+      if (gen !== root.listGen || root.listSettledGen === gen) return
+      listDeadline.stop()
       var overflow = root.listOverflow
       var text = root.takeStream("list")
-      Qt.callLater(function() { root.applyList(overflow ? 1 : code, text) })
+      Qt.callLater(function() {
+        if (gen !== root.listGen || root.listSettledGen === gen) return
+        root.listSettledGen = gen
+        root.applyList(overflow ? 1 : code, text)
+      })
     }
   }
 
-  // No startup deadline. The polkit prompt waits until the person answers.
+  // The deadline starts when the process does, and it is long enough for
+  // the password prompt. A failed start never emits exited.
   Process {
     id: actionProc
     clearEnvironment: true
     environment: root.sessionEnvironment
     stdout: SplitParser { splitMarker: ""; onRead: function(data) { root.noteStream("action", data, true) } }
     stderr: SplitParser { splitMarker: ""; onRead: function(data) { root.noteStream("action", data, false) } }
+    onStarted: {
+      root.actionStartedGen = root.actionGen
+      root.actionRunningGen = root.actionGen
+      actionDeadline.restart()
+    }
+    onRunningChanged: root.noteStop("action")
     onExited: function(code) {
+      var gen = root.actionRunningGen
+      if (gen !== root.actionGen || root.actionSettledGen === gen) return
+      actionDeadline.stop()
       var overflow = root.actionOverflow
       var text = root.takeStream("action")
-      Qt.callLater(function() { root.finishAction(overflow ? 1 : code, text) })
+      Qt.callLater(function() {
+        if (gen !== root.actionGen || root.actionSettledGen === gen) return
+        root.actionSettledGen = gen
+        root.finishAction(overflow ? 1 : code, text)
+      })
     }
   }
 
@@ -924,10 +1064,21 @@ Panel {
     environment: root.sessionEnvironment
     stdout: SplitParser { splitMarker: ""; onRead: function(data) { root.noteStream("clear", data, true) } }
     stderr: SplitParser { splitMarker: ""; onRead: function(data) { root.noteStream("clear", data, false) } }
+    onStarted: {
+      root.clearStartedGen = root.clearGen
+      root.clearRunningGen = root.clearGen
+      clearDeadline.restart()
+    }
+    onRunningChanged: root.noteStop("clear")
     onExited: function(code) {
+      var gen = root.clearRunningGen
+      if (gen !== root.clearGen || root.clearSettledGen === gen) return
+      clearDeadline.stop()
       var overflow = root.clearOverflow
       var text = root.takeStream("clear")
       Qt.callLater(function() {
+        if (gen !== root.clearGen || root.clearSettledGen === gen) return
+        root.clearSettledGen = gen
         root.busy = false
         var parsed = Model.parsePayload(text)
         if (overflow || code !== 0 || !parsed.ok) {

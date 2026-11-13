@@ -17,7 +17,7 @@
 set -euo pipefail
 IFS=$' \t\n'
 
-VERSION="1.4.0"
+VERSION="1.4.1"
 
 # Privileged programs are absolute paths. PATH is reset to system directories
 # before any other command is looked up, and nothing looked up on PATH is
@@ -89,6 +89,7 @@ sanitize_environment() {
   if (( dirty )); then
     exec /usr/bin/env -i \
       TARGET_BOOT_SANITIZED=1 \
+      TARGET_BOOT_LEADER="${TARGET_BOOT_LEADER-}" \
       PATH="$base" \
       HOME="${HOME-}" \
       USER="${USER-}" \
@@ -105,9 +106,52 @@ sanitize_environment() {
   fi
   unset LD_PRELOAD LD_LIBRARY_PATH BASH_ENV ENV
   export PATH="$base"
-  if trusted_dir "$OMARCHY_BIN"; then
-    export PATH="$base:$OMARCHY_BIN"
+}
+
+# Become the process-group leader once. Quickshell's signal() reaches this
+# process only, and kill of this pid is this group only after setpgid.
+# A failure is remembered so a refused setpgid cannot re-exec forever.
+lead_process_group() {
+  [[ ${TARGET_BOOT_LEADER:-} == 1 || ${TARGET_BOOT_LEADER:-} == 0 ]] && return 0
+  trusted_executable "$PYTHON" || return 0
+  export TARGET_BOOT_LEADER=1
+  exec "$PYTHON" -I -S -c 'import os, sys
+try:
+    os.setpgid(0, 0)
+except OSError:
+    os.environ["TARGET_BOOT_LEADER"] = "0"
+os.execv("/usr/bin/bash", ["/usr/bin/bash", "--", *sys.argv[1:]])' "$0" "$@"
+}
+
+# Fork clears the parent-death signal, and exec keeps it. The child sets
+# the signal itself. Quickshell SIGKILLs this script on unload, which does
+# not reach pkexec; the kernel delivers this when the parent dies.
+tie_to_parent() {
+  trusted_executable "$PYTHON" || return 127
+  "$PYTHON" -I -S -c 'import ctypes, os, signal, sys
+if len(sys.argv) < 2:
+    os._exit(127)
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:
+    os._exit(127)
+if os.getppid() == 1:
+    os._exit(127)
+os.execv(sys.argv[1], sys.argv[1:])' "$@"
+}
+
+# TERM from the panel. Ignore it here so the group signal does not kill this
+# shell before the children are signalled, then kill the whole group.
+reap_group() {
+  trap '' TERM INT
+  if [[ ${TARGET_BOOT_LEADER:-} == 1 ]]; then
+    kill -TERM -- -$$ 2>/dev/null || true
   fi
+  release_holder
+  /usr/bin/sleep 0.4 || true
+  if [[ ${TARGET_BOOT_LEADER:-} == 1 ]]; then
+    kill -KILL -- -$$ 2>/dev/null || true
+  fi
+  exit 143
 }
 
 jq() { "$JQ" "$@"; }
@@ -158,8 +202,10 @@ json_argv() {
 
 # Stdout and stderr are capped while the command runs. Nothing is stored in
 # /tmp. There is no deadline here: pkexec waits for the polkit prompt, and a
-# short timeout would cancel that prompt. CAPTURE_FD, when set, is an open
-# descriptor duplicated onto the command's standard input.
+# short timeout would cancel that prompt. The panel's own deadline is the
+# bound. The command is tied to this process so it dies with the script.
+# CAPTURE_FD, when set, is an open descriptor duplicated onto the command's
+# standard input.
 capture() {
   local in_fd="" max=262144 emax=8192
   local out_w err_w out_keep err_keep status out_len err_len
@@ -185,9 +231,9 @@ capture() {
   exec {err_keep}<&"${CAPERR[0]}"
   set +e
   if [[ -n $in_fd ]]; then
-    "$@" <&"$in_fd" >&"$out_w" 2>&"$err_w"
+    tie_to_parent "$@" <&"$in_fd" >&"$out_w" 2>&"$err_w"
   else
-    "$@" >&"$out_w" 2>&"$err_w"
+    tie_to_parent "$@" >&"$out_w" 2>&"$err_w"
   fi
   status=$?
   set -e
@@ -1217,7 +1263,10 @@ seal_load_option() {
   [[ $sum_emit =~ ^[0-9a-f]{64}$ ]] || return 1
   coproc HOLDER {
     exec "$PYTHON" -I -S -c '
-import fcntl, os, sys
+import ctypes, fcntl, os, signal, sys
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:
+    sys.exit(2)
 line = sys.stdin.buffer.readline()
 if not line:
     sys.exit(2)
@@ -1539,7 +1588,12 @@ arm_usb() {
 }
 
 sanitize_environment "$@"
+lead_process_group "$@"
+if trusted_dir "$OMARCHY_BIN"; then
+  export PATH="/usr/bin:/bin:$OMARCHY_BIN"
+fi
 trap release_holder EXIT
+trap reap_group TERM INT
 
 if ! trusted_executable "$JQ"; then
   printf '%s\n' '{"ok":false,"error":"jq is not installed"}'

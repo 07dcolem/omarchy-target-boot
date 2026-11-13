@@ -1,5 +1,12 @@
 # Changelog
 
+### 1.4.1
+
+- The boot menu stops waiting after 20 seconds. A reboot or a clear of next boot stops waiting after 3 minutes, which leaves time to answer the password prompt, and the menu is usable again after that.
+- Closing the menu stops the helper and the programs it started, including a password prompt that is still open.
+- A helper that fails to start no longer leaves the menu busy.
+- A finished firmware read is applied, so the menu does not stay on “Reading firmware…”.
+
 ### 1.4.0
 
 - A plugged-in removable USB drive with `\EFI\BOOT\BOOTX64.EFI`, or the 32-bit or ARM fallback, is listed in its own section. Choosing it counts down, then sets next boot to that drive.

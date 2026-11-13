@@ -21,6 +21,24 @@ function countdownStart() {
   return 4
 }
 
+// The menu read is unprivileged. Reboot and clear wait on the password prompt.
+function listDeadlineMs() {
+  return 20000
+}
+
+function actionDeadlineMs() {
+  return 180000
+}
+
+// Quickshell emits runningChanged without started or exited when the binary
+// fails to start. A stop after started is the normal exit path.
+function processStop(running, generation, startedGeneration, settledGeneration) {
+  if (running) return "running"
+  if (settledGeneration === generation) return "settled"
+  if (startedGeneration === generation) return "exited"
+  return "failed-start"
+}
+
 function poofText() {
   return "˚ ✦ poof ✦ ˚"
 }
@@ -433,6 +451,9 @@ if (typeof module !== "undefined") {
     flickMs: flickMs,
     poofMs: poofMs,
     countdownStart: countdownStart,
+    listDeadlineMs: listDeadlineMs,
+    actionDeadlineMs: actionDeadlineMs,
+    processStop: processStop,
     poofText: poofText,
     normalizeId: normalizeId,
     plain: plain,

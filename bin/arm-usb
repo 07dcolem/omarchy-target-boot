@@ -4,6 +4,7 @@
 # directory is the source for that install. It refuses to write firmware.
 # The load option arrives on standard input. It is not a path argument.
 
+import ctypes
 import fcntl
 import os
 import re
@@ -29,6 +30,28 @@ SERIAL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,64}")
 BOOT_ID = re.compile(r"[0-9A-F]{4}")
 OUT_MAX = 262144
 ERR_MAX = 8192
+# Fork clears the parent-death signal. efivar is in its own session, so a
+# group kill of this helper does not reach it. The child sets the signal.
+_LIBC = ctypes.CDLL(None, use_errno=True)
+LIVE = []
+_STOPPING = False
+
+
+def tie_parent():
+    """Die when the parent dies. Called in the child, after fork."""
+    if _LIBC.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:
+        os._exit(127)
+
+
+def _stop_live(signum, _frame):
+    global _STOPPING
+    if _STOPPING:
+        return
+    _STOPPING = True
+    for proc in list(LIVE):
+        stop_group(proc)
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
 
 
 def die(message):
@@ -160,9 +183,11 @@ def run(args):
             stderr=subprocess.PIPE,
             env=CLEAN,
             start_new_session=True,
+            preexec_fn=tie_parent,
         )
     except OSError:
         die("Could not read the EFI boot entries")
+    LIVE.append(proc)
     out = bytearray()
     err = bytearray()
     streams = [proc.stdout, proc.stderr]
@@ -203,6 +228,8 @@ def run(args):
                 stop_group(proc)
                 timed_out = True
     finally:
+        if proc in LIVE:
+            LIVE.remove(proc)
         for stream in (proc.stdout, proc.stderr):
             try:
                 stream.close()
@@ -341,6 +368,8 @@ def write_mode():
 
 def main():
     isolate()
+    signal.signal(signal.SIGTERM, _stop_live)
+    signal.signal(signal.SIGINT, _stop_live)
     if len(sys.argv) == 2 and sys.argv[1] == "--check":
         check_mode()
         return

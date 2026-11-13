@@ -220,4 +220,12 @@ const matched = {
 assert.strictEqual(Model.nextBootLabel(matched, {}), "DVD_ROM")
 assert.strictEqual(Model.usbIcon(), "󰕓")
 
+assert.strictEqual(Model.listDeadlineMs(), 20000)
+assert.strictEqual(Model.actionDeadlineMs(), 180000)
+assert.strictEqual(Model.processStop(true, 1, 1, -1), "running")
+assert.strictEqual(Model.processStop(false, 1, -1, -1), "failed-start")
+assert.strictEqual(Model.processStop(false, 2, 1, 1), "failed-start")
+assert.strictEqual(Model.processStop(false, 1, 1, -1), "exited")
+assert.strictEqual(Model.processStop(false, 1, 1, 1), "settled")
+
 console.log("model.test.js ok")

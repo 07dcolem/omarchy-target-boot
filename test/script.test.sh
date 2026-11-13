@@ -533,4 +533,99 @@ PY
 rm -rf -- "$offer_home"
 rm -f -- /tmp/reboot-into-list.json /tmp/reboot-into-shell-before.json
 
+# The panel owns the deadlines. FailedToStart never emits exited, so the
+# stop decision has to treat "not started" as its own path. Destruction
+# only signals the wrapper, so the script leads its group and ties children.
+grep -q 'readonly property int listDeadlineMs: Model.listDeadlineMs()' "$root/Panel.qml"
+grep -q 'readonly property int actionDeadlineMs: Model.actionDeadlineMs()' "$root/Panel.qml"
+grep -q 'interval: root.listDeadlineMs' "$root/Panel.qml"
+grep -q 'interval: root.actionDeadlineMs' "$root/Panel.qml"
+grep -q 'onRunningChanged: root.noteStop("list")' "$root/Panel.qml"
+grep -q 'onRunningChanged: root.noteStop("action")' "$root/Panel.qml"
+grep -q 'onRunningChanged: root.noteStop("clear")' "$root/Panel.qml"
+grep -q 'The reboot helper did not start' "$root/Panel.qml"
+grep -q 'Next boot timed out' "$root/Panel.qml"
+grep -q 'Reading the boot menu timed out' "$root/Panel.qml"
+grep -q 'Clearing next boot timed out' "$root/Panel.qml"
+grep -q 'os.setpgid(0, 0)' "$cli"
+grep -q 'tie_to_parent "$@"' "$cli"
+grep -q -F 'kill -TERM -- -$$' "$cli"
+grep -q -F 'kill -KILL -- -$$' "$cli"
+grep -q 'preexec_fn=tie_parent' "$root/bin/arm-usb"
+grep -q 'signal.signal(signal.SIGTERM, _stop_live)' "$root/bin/arm-usb"
+if grep -n 'No startup deadline' "$root/Panel.qml"; then
+  echo "a privileged action still has no deadline" >&2
+  exit 1
+fi
+# Timer and process ids are document ids. root.listDeadline is undefined and
+# the exit handler then drops the firmware list.
+if grep -n -E 'root\.(list|action|clear)(Deadline|Proc|Kill)\b' "$root/Panel.qml"; then
+  echo "a process id is read as a property of the panel" >&2
+  exit 1
+fi
+
+# Fork clears the parent-death signal. The child has to set it, or a
+# SIGKILL of the leader leaves the grandchild running.
+python3 -I -S - "$root/bin/arm-usb" <<'PY'
+import os, signal, subprocess, sys, time
+path = sys.argv[1]
+ns = {"__name__": "arm_usb", "__file__": path}
+with open(path, "r", encoding="utf-8") as handle:
+    exec(compile(handle.read(), path, "exec"), ns)
+tie = ns["tie_parent"]
+read_end, write_end = os.pipe()
+middle = os.fork()
+if middle == 0:
+    os.close(read_end)
+    child = os.fork()
+    if child == 0:
+        os.close(write_end)
+        tie()
+        os.execv("/usr/bin/sleep", ["sleep", "30"])
+    os.write(write_end, b"%d\n" % child)
+    os.close(write_end)
+    time.sleep(30)
+    os._exit(0)
+os.close(write_end)
+child = int(os.read(read_end, 32).split()[0])
+os.close(read_end)
+time.sleep(0.1)
+try:
+    os.kill(child, 0)
+except ProcessLookupError:
+    sys.exit("the tied child exited before its parent")
+os.kill(middle, signal.SIGKILL)
+os.waitpid(middle, 0)
+deadline = time.monotonic() + 2
+while time.monotonic() < deadline:
+    try:
+        os.kill(child, 0)
+    except ProcessLookupError:
+        break
+    time.sleep(0.05)
+else:
+    os.kill(child, signal.SIGKILL)
+    sys.exit("a tied child survived its parent")
+print("tied child ok")
+PY
+
+# The lead lasts for the whole run. Sample until it exits and require the
+# process group id to match the pid at least once.
+"$cli" list --fixture "$fix" >/dev/null &
+leader=$!
+leader_seen=0
+while kill -0 "$leader" 2>/dev/null; do
+  leader_pgid=$(ps -o pgid= -p "$leader" 2>/dev/null || true)
+  leader_pgid=${leader_pgid//[[:space:]]/}
+  if [[ $leader_pgid == "$leader" ]]; then
+    leader_seen=1
+    break
+  fi
+done
+wait "$leader"
+if [[ $leader_seen != 1 ]]; then
+  echo "the helper did not lead its process group" >&2
+  exit 1
+fi
+
 echo "script.test.sh ok"
