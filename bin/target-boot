@@ -8,8 +8,10 @@
 # efibootmgr --create-only so it is not added to BootOrder, then selected
 # with --bootnext in that same command. A stick with no partition table is
 # armed by one root-owned helper, which writes one Boot#### load option and
-# then selects it. The load option is that helper's standard input. This
-# script never passes itself, a shell string, or a plugin file to pkexec.
+# then selects it. The load option is that helper's standard input. Every
+# privileged command is started by the installed supervisor. pkexec runs
+# that supervisor, never this script, a shell string, or a plugin file.
+# The supervisor kills the firmware program when this process exits.
 # A previous entry with this plugin's label is removed only when it
 # is not in BootOrder. BootOrder is parsed so it can be compared after a
 # write. It is never passed back.
@@ -17,7 +19,7 @@
 set -euo pipefail
 IFS=$' \t\n'
 
-VERSION="1.4.1"
+VERSION="1.4.2"
 
 # Privileged programs are absolute paths. PATH is reset to system directories
 # before any other command is looked up, and nothing looked up on PATH is
@@ -48,9 +50,13 @@ READLINK=/usr/bin/readlink
 EFIVAR=/usr/bin/efivar
 EFI_GUID="8be4df61-93ca-11d2-aa0d-00e098032b8c"
 # Root-owned helper for a partitionless stick that does not already have an
-# entry. pkexec runs this path only. The copy beside this script is the
-# source that gets installed there. It is never the program pkexec runs.
+# entry. The supervisor executes this path. pkexec does not. The copy beside
+# this script is the source that gets installed there.
 ARM_USB=/usr/local/libexec/io.github.07dcolem.target-boot/arm-usb
+# Root-owned supervisor. pkexec runs this path only. It watches this process
+# and kills efibootmgr or arm-usb when this process exits. Linux clears a
+# parent-death signal set before pkexec, because pkexec is setuid.
+SUPERVISE=/usr/local/libexec/io.github.07dcolem.target-boot/supervise
 # Fixed firmware label for the one-shot USB entry. It is how a later read
 # recognises an entry this plugin created. Volume names from the stick are
 # never written into firmware.
@@ -123,9 +129,10 @@ except OSError:
 os.execv("/usr/bin/bash", ["/usr/bin/bash", "--", *sys.argv[1:]])' "$0" "$@"
 }
 
-# Fork clears the parent-death signal, and exec keeps it. The child sets
-# the signal itself. Quickshell SIGKILLs this script on unload, which does
-# not reach pkexec; the kernel delivers this when the parent dies.
+# Fork clears the parent-death signal. Exec of an ordinary program keeps
+# the signal the child sets here. Exec of pkexec clears it, because pkexec
+# is setuid, and the menu cannot signal the root process afterwards.
+# Unprivileged children use this. Privileged commands use the supervisor.
 tie_to_parent() {
   trusted_executable "$PYTHON" || return 127
   "$PYTHON" -I -S -c 'import ctypes, os, signal, sys
@@ -140,7 +147,9 @@ os.execv(sys.argv[1], sys.argv[1:])' "$@"
 }
 
 # TERM from the panel. Ignore it here so the group signal does not kill this
-# shell before the children are signalled, then kill the whole group.
+# shell before the children are signalled, then kill the whole group. A root
+# child is a different user, so the group signal does not reach it. That
+# child is the supervisor, which kills its own worker when this process exits.
 reap_group() {
   trap '' TERM INT
   if [[ ${TARGET_BOOT_LEADER:-} == 1 ]]; then
@@ -203,7 +212,8 @@ json_argv() {
 # Stdout and stderr are capped while the command runs. Nothing is stored in
 # /tmp. There is no deadline here: pkexec waits for the polkit prompt, and a
 # short timeout would cancel that prompt. The panel's own deadline is the
-# bound. The command is tied to this process so it dies with the script.
+# bound. An unprivileged command is tied to this process. A privileged
+# command is the supervisor, which is tied again after it becomes root.
 # CAPTURE_FD, when set, is an open descriptor duplicated onto the command's
 # standard input.
 capture() {
@@ -257,11 +267,11 @@ capture() {
 }
 
 # Root via passwordless sudo when the machine offers it, otherwise the
-# session polkit agent. The elevated program is the pinned efibootmgr, or
-# the root-owned USB helper. Never a path taken from PATH, and never a
-# shell string. pkexec treats a leading -- as the program name, so the
-# binary is the first argument. This script stays the logged-in user so
-# the reboot runs in that user's systemd session.
+# session polkit agent. The elevated program is the installed supervisor,
+# which then runs the pinned efibootmgr or the root-owned USB helper.
+# Never a path taken from PATH, and never a shell string. pkexec treats a
+# leading -- as the program name, so the supervisor is the first argument.
+# This script stays the logged-in user so the reboot runs in that session.
 require_efi() {
   trusted_executable "$EFIBOOTMGR" || fail "efibootmgr is not installed"
 }
@@ -1320,10 +1330,9 @@ sys.stdin.buffer.read(1)
   [[ $sum_fd == "$sum_emit" ]] || return 1
 }
 
-# Root via passwordless sudo when the machine offers it, otherwise the
-# session polkit agent. The elevated program is a pinned system binary.
-# pkexec treats a leading -- as the program name, so the binary is the
-# first argument.
+# The supervisor is the only privileged program. It finds the menu process
+# itself, so this script does not pass a pid. The caller names efibootmgr
+# or arm-usb, and the supervisor refuses anything else.
 priv_exec() {
   local bin=$1
   shift
@@ -1333,12 +1342,13 @@ priv_exec() {
     CAP_ERR="not installed"
     return
   fi
+  require_supervise
   if [[ $(id -u) -eq 0 ]]; then
-    capture "$bin" "$@"
+    capture "$SUPERVISE" "$bin" "$@"
     return
   fi
   if trusted_executable "$SUDO" && "$SUDO" -n /usr/bin/true >/dev/null 2>&1; then
-    capture "$SUDO" -n -- "$bin" "$@"
+    capture "$SUDO" -n -- "$SUPERVISE" "$bin" "$@"
     return
   fi
   if ! trusted_executable "$PKEXEC"; then
@@ -1347,7 +1357,7 @@ priv_exec() {
     CAP_ERR="pkexec was not found"
     return
   fi
-  capture "$PKEXEC" "$bin" "$@"
+  capture "$PKEXEC" "$SUPERVISE" "$bin" "$@"
 }
 
 stale_owned_ids() {
@@ -1371,22 +1381,36 @@ collect_stale() {
   done < <(stale_owned_ids "$keep")
 }
 
-# The installed helper must be the root-owned file, and its bytes must match
-# the copy shipped with this plugin. A mismatch refuses rather than running
-# a different program. This does not install or replace that file.
-require_arm() {
+# The installed file must be root-owned, and its bytes must match the copy
+# shipped beside this script. A mismatch refuses rather than running a
+# different program. This does not install or replace that file.
+require_matching() {
+  local installed=$1 src_name=$2 missing=$3 mismatch=$4
   local src path sum_src sum_ins
-  trusted_executable "$ARM_USB" || fail "The USB boot helper is not installed"
-  path=$("$READLINK" -f -- "$0") || fail "The USB boot helper is not installed"
-  [[ $path == /*/target-boot ]] || fail "The USB boot helper is not installed"
-  src=${path%/*}/arm-usb
-  [[ -f $src && ! -L $src ]] || fail "The USB boot helper is not installed"
-  trusted_executable "$SHA256" || fail "The USB boot helper is not installed"
-  sum_src=$("$SHA256" -- "$src") || fail "The USB boot helper is not installed"
-  sum_ins=$("$SHA256" -- "$ARM_USB") || fail "The USB boot helper is not installed"
+  [[ $src_name =~ ^[a-z-]+$ ]] || fail "$missing"
+  trusted_executable "$installed" || fail "$missing"
+  path=$("$READLINK" -f -- "$0") || fail "$missing"
+  [[ $path == /*/target-boot ]] || fail "$missing"
+  src=${path%/*}/$src_name
+  [[ -f $src && ! -L $src ]] || fail "$missing"
+  trusted_executable "$SHA256" || fail "$missing"
+  sum_src=$("$SHA256" -- "$src") || fail "$missing"
+  sum_ins=$("$SHA256" -- "$installed") || fail "$missing"
   sum_src=${sum_src%% *}
   sum_ins=${sum_ins%% *}
-  [[ $sum_src =~ ^[0-9a-f]{64}$ && $sum_src == "$sum_ins" ]] || fail "The USB boot helper does not match this plugin"
+  [[ $sum_src =~ ^[0-9a-f]{64}$ && $sum_src == "$sum_ins" ]] || fail "$mismatch"
+}
+
+require_supervise() {
+  require_matching "$SUPERVISE" supervise \
+    "The reboot helper is not installed" \
+    "The reboot helper does not match this plugin"
+}
+
+require_arm() {
+  require_matching "$ARM_USB" arm-usb \
+    "The USB boot helper is not installed" \
+    "The USB boot helper does not match this plugin"
 }
 
 # An entry this plugin already wrote for this stick. The firmware's text

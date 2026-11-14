@@ -722,9 +722,12 @@ Panel {
     if (!committed) cancelDeparture()
   }
   Component.onCompleted: refresh()
-  // TERM asks the script to reap its group. Quickshell then SIGKILLs the
-  // script, and each child is tied to that process so it dies with it.
-  // The escalation timers die with this panel, so they are not the cleanup.
+  // TERM asks the script to stop. Quickshell then SIGKILLs the script if it
+  // is still running. That signal does not reach a root child: pkexec is
+  // setuid, so the parent-death signal set beforehand was cleared. The
+  // installed supervisor sets the signal again after it is root and kills
+  // the firmware program when this script exits. The escalation timers die
+  // with this panel, so they are not the cleanup.
   Component.onDestruction: {
     if (listProc.running) listProc.signal(15)
     if (actionProc.running) actionProc.signal(15)
@@ -974,6 +977,8 @@ Panel {
     if (which === "action") { actionSettledGen = gen; actionDeadline.stop() }
     else if (which === "clear") { clearSettledGen = gen; clearDeadline.stop() }
     else { listSettledGen = gen; listDeadline.stop() }
+    // This reaches the script only. The supervisor watches that process and
+    // kills the firmware program when the script exits.
     if (proc.running) proc.signal(15)
     timer.restart()
     if (which === "list") {

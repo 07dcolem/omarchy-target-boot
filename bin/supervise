@@ -1,0 +1,267 @@
+#!/usr/bin/python3
+# Installed copy: /usr/local/libexec/io.github.07dcolem.target-boot/supervise
+# Root-owned, mode 0755. pkexec runs this path. It is not a shell and it is
+# not a copy from the plugin directory. Linux clears the parent-death signal
+# when pkexec, which is setuid, is executed, and after pkexec becomes root the
+# menu can no longer signal it. This program sets that signal again, then
+# runs one allowlisted program and kills it when the menu process exits.
+
+import ctypes
+import os
+import select
+import signal
+import stat
+import sys
+
+EXPECTED = "/usr/local/libexec/io.github.07dcolem.target-boot/supervise"
+EFI = "/usr/bin/efibootmgr"
+ARM = "/usr/local/libexec/io.github.07dcolem.target-boot/arm-usb"
+# Used only when this file is not root, so the lifecycle test can run
+# without elevation. Root refuses it.
+SLEEP = "/usr/bin/sleep"
+ALLOWED = (EFI, ARM)
+CLEAN = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"}
+_LIBC = ctypes.CDLL(None, use_errno=True)
+
+
+def die(message, code=127):
+    sys.stderr.write(message + "\n")
+    sys.stderr.flush()
+    raise SystemExit(code)
+
+
+def set_pdeath(sig):
+    """Die with sig when the parent dies. Fork clears it, so call after fork."""
+    if _LIBC.prctl(1, sig, 0, 0, 0) != 0:
+        os._exit(127)
+
+
+def assert_installed():
+    try:
+        info = os.lstat(EXPECTED)
+        parent = os.lstat(os.path.dirname(EXPECTED))
+    except OSError:
+        die("The reboot helper is not the installed copy")
+    if os.path.realpath(__file__) != EXPECTED or stat.S_ISLNK(info.st_mode):
+        die("The reboot helper is not the installed copy")
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        die("The reboot helper is not the installed copy")
+    if (not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode)
+            or parent.st_uid != 0 or parent.st_mode & 0o022):
+        die("The reboot helper is not the installed copy")
+
+
+def status_fields(pid, key):
+    try:
+        handle = open("/proc/%d/status" % pid, "r", encoding="ascii", errors="strict")
+    except OSError:
+        die("The menu process is gone", 143)
+    try:
+        for line in handle:
+            if line.startswith(key + ":"):
+                return line.split()[1:]
+    finally:
+        handle.close()
+    die("The menu process is gone", 143)
+
+
+def ppid_of(pid):
+    fields = status_fields(pid, "PPid")
+    if len(fields) != 1 or not fields[0].isdigit():
+        die("The menu process is gone", 143)
+    return int(fields[0])
+
+
+def real_uid(pid):
+    fields = status_fields(pid, "Uid")
+    if not fields or not fields[0].isdigit():
+        die("The menu process is gone", 143)
+    return int(fields[0])
+
+
+def state_of(pid):
+    try:
+        handle = open("/proc/%d/stat" % pid, "rb")
+    except OSError:
+        die("The menu process is gone", 143)
+    try:
+        raw = handle.read(4096)
+    finally:
+        handle.close()
+    end = raw.rfind(b")")
+    if end < 0 or end + 2 >= len(raw):
+        die("The menu process is gone", 143)
+    return raw[end + 2:end + 3]
+
+
+def parse_uid(value):
+    if not value.isascii() or not value.isdigit() or len(value) > 10:
+        die("The reboot helper refused the caller")
+    return int(value)
+
+
+def invoking_uid():
+    """Set by pkexec or sudo after they clear the caller's environment."""
+    if os.geteuid() != 0:
+        return None
+    if "PKEXEC_UID" in os.environ:
+        return parse_uid(os.environ["PKEXEC_UID"])
+    if "SUDO_UID" in os.environ:
+        return parse_uid(os.environ["SUDO_UID"])
+    return None
+
+
+def leader_pid():
+    """Nearest ancestor the menu can actually signal.
+
+    pkexec and sudo sit in between as root. A pid from argv is not accepted,
+    because the plugin could name a process that does not exit with the menu.
+    """
+    expected = invoking_uid()
+    current = os.getpid()
+    for _ in range(8):
+        parent = ppid_of(current)
+        if parent <= 1:
+            break
+        if expected is None or real_uid(parent) == expected:
+            if state_of(parent) in (b"Z", b"X"):
+                die("The menu process is gone", 143)
+            return parent
+        current = parent
+    die("The menu process is gone", 143)
+
+
+def open_checked(path):
+    directory, name = os.path.split(path)
+    if not directory or not name or name in (".", ".."):
+        die("The reboot helper refused that program")
+    try:
+        dirfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        die("The reboot helper refused that program")
+    try:
+        parent = os.fstat(dirfd)
+        if (not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0
+                or parent.st_mode & 0o022):
+            die("The reboot helper refused that program")
+        try:
+            handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dirfd)
+        except OSError:
+            die("The reboot helper refused that program")
+        try:
+            info = os.fstat(handle)
+        finally:
+            os.close(handle)
+    finally:
+        os.close(dirfd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0
+            or info.st_mode & 0o022 or not info.st_mode & 0o111):
+        die("The reboot helper refused that program")
+
+
+def worker_path():
+    if len(sys.argv) < 2:
+        die("The reboot helper refused that program")
+    path = sys.argv[1]
+    allowed = path in ALLOWED or (os.geteuid() != 0 and path == SLEEP)
+    if not allowed:
+        die("The reboot helper refused that program")
+    open_checked(path)
+    return path
+
+
+def kill_worker(pid):
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def finish(status):
+    code = os.waitstatus_to_exitcode(status)
+    if code < 0:
+        os._exit(128 + (-code))
+    os._exit(code)
+
+
+def watch(pidfd, worker):
+    while True:
+        if os.getppid() == 1:
+            break
+        try:
+            ready, _, _ = select.select([pidfd], [], [], 0.2)
+        except InterruptedError:
+            continue
+        if ready:
+            break
+        try:
+            found, status = os.waitpid(worker, os.WNOHANG)
+        except InterruptedError:
+            continue
+        except ChildProcessError:
+            os._exit(137)
+        if found == worker:
+            os.close(pidfd)
+            finish(status)
+    kill_worker(worker)
+    os.close(pidfd)
+    while True:
+        try:
+            found, status = os.waitpid(worker, 0)
+        except InterruptedError:
+            continue
+        except ChildProcessError:
+            os._exit(137)
+        if found == worker:
+            finish(status)
+
+
+def main():
+    # pkexec is setuid, so a signal set by the menu was cleared. Set it again
+    # before anything else, then re-check in case the parent already exited.
+    set_pdeath(signal.SIGKILL)
+    if os.getppid() == 1:
+        os._exit(143)
+    if os.geteuid() == 0:
+        assert_installed()
+    if not (sys.flags.isolated and sys.flags.no_site):
+        path = EXPECTED if os.geteuid() == 0 else os.path.realpath(__file__)
+        os.execv("/usr/bin/python3", ["/usr/bin/python3", "-I", "-S", path, *sys.argv[1:]])
+    set_pdeath(signal.SIGKILL)
+    if os.getppid() == 1:
+        os._exit(143)
+    path = worker_path()
+    leader = leader_pid()
+    try:
+        pidfd = os.pidfd_open(leader)
+    except OSError:
+        die("The menu process is gone", 143)
+    os.set_inheritable(pidfd, False)
+    if state_of(leader) in (b"Z", b"X"):
+        die("The menu process is gone", 143)
+    worker = os.fork()
+    if worker == 0:
+        try:
+            os.close(pidfd)
+        except OSError:
+            pass
+        set_pdeath(signal.SIGKILL)
+        if os.getppid() == 1:
+            os._exit(143)
+        try:
+            os.setpgid(0, 0)
+        except OSError:
+            os._exit(127)
+        try:
+            os.execve(path, [path, *sys.argv[2:]], CLEAN)
+        except OSError:
+            os._exit(127)
+    watch(pidfd, worker)
+
+
+if __name__ == "__main__":
+    main()

@@ -34,22 +34,24 @@ Remove it with:
 omarchy plugin remove io.github.07dcolem.target-boot
 ```
 
-A partitionless USB drive that does not already have an entry also needs a
-root-owned helper. Firmware rows, a partitioned stick, and a stick this
-plugin has already armed do not. Install the helper once, in a terminal.
-The policy asks for the password every time. It does not remember it.
+Setting the next boot needs a root-owned helper. The menu can list the
+firmware without it. A partitionless USB drive that does not already have
+an entry also needs the USB helper installed beside it. Install both once,
+in a terminal. The policy asks for the password every time. It does not
+remember it.
 
 ```bash
 plugin=~/.config/omarchy/plugins/io.github.07dcolem.target-boot
 sudo install -d -o root -g root -m 0755 /usr/local/libexec/io.github.07dcolem.target-boot
+sudo install -o root -g root -m 0755 "$plugin/bin/supervise" /usr/local/libexec/io.github.07dcolem.target-boot/supervise
 sudo install -o root -g root -m 0755 "$plugin/bin/arm-usb" /usr/local/libexec/io.github.07dcolem.target-boot/arm-usb
 sudo install -o root -g root -m 0644 "$plugin/polkit/io.github.07dcolem.target-boot.policy" /usr/share/polkit-1/actions/io.github.07dcolem.target-boot.policy
 ```
 
-Those two files stay after `omarchy plugin remove`. Remove them with:
+Those files stay after `omarchy plugin remove`. Remove them with:
 
 ```bash
-sudo rm -f /usr/local/libexec/io.github.07dcolem.target-boot/arm-usb /usr/share/polkit-1/actions/io.github.07dcolem.target-boot.policy
+sudo rm -f /usr/local/libexec/io.github.07dcolem.target-boot/supervise /usr/local/libexec/io.github.07dcolem.target-boot/arm-usb /usr/share/polkit-1/actions/io.github.07dcolem.target-boot.policy
 sudo rmdir /usr/local/libexec/io.github.07dcolem.target-boot
 ```
 
@@ -168,14 +170,17 @@ that same one-shot variable. It does not delete the temporary USB entry.
 Rename and hide are saved on the widget entry in `shell.json`.
 
 Writing next boot needs root. The plugin drops the caller’s environment and
-runs only the system copy of `efibootmgr`, or the root-owned helper above
-for a partitionless drive that has no entry yet. That helper is the program
-`pkexec` runs. The plugin does not hand `pkexec` a shell string or a file
-from its own directory. Passwordless `sudo` is used when the machine
-already allows that program without a password. Otherwise `pkexec` asks
-through Omarchy’s polkit prompt, and that prompt appears at the end of the
-countdown. The reboot itself runs as you, through `omarchy system reboot`,
-because the logged-in session is already allowed to reboot.
+runs the installed supervisor. That supervisor is the program `pkexec` runs.
+It then runs only the system copy of `efibootmgr`, or the root-owned USB
+helper for a partitionless drive that has no entry yet. The plugin does not
+hand `pkexec` a shell string or a file from its own directory. The supervisor
+kills that firmware program if the menu is closed or the wait runs out,
+including after the password prompt has started it as root. Passwordless
+`sudo` is used when the machine already allows that program without a
+password. Otherwise `pkexec` asks through Omarchy’s polkit prompt, and that
+prompt appears at the end of the countdown. The reboot itself runs as you,
+through `omarchy system reboot`, because the logged-in session is already
+allowed to reboot.
 
 ## Settings
 
@@ -236,7 +241,8 @@ the hold. Go now and Shift+Enter do that from the panel.
 
 `Panel.qml` is the bar widget and the popup. `Model.js` is the countdown copy,
 the row text, the name map, the hidden list, the USB rows, and the JSON parsing, with no
-processes in it. `bin/target-boot` is the only thing that runs `efibootmgr`.
+processes in it. `bin/target-boot` decides what to write. The installed
+supervisor is the program that runs `efibootmgr` as root.
 It is also what looks at USB drives. A volume that is already mounted is read
 in place and left mounted. A volume this scan mounted itself, through
 `udisksctl` as you, is unmounted when the look finishes. The loader path
@@ -257,6 +263,11 @@ omarchy plugin validate .
 ```
 
 ## Changelog
+
+### 1.4.2
+
+- Setting next boot runs a root-owned helper. If the menu is closed or the wait runs out, that helper kills the firmware program, including after the password prompt has started it as root.
+- The menu still lists firmware without the helper. Install the helper once. The partitionless USB helper installs beside it.
 
 ### 1.4.1
 

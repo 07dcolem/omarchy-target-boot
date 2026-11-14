@@ -339,7 +339,7 @@ if grep -n -E 'auth_admin_keep|<allow_active>yes</allow_active>|<allow_any>yes</
   echo "the USB helper policy would skip the password" >&2
   exit 1
 fi
-if grep -n -E 'bash[[:space:]]+-c|sh[[:space:]]+-c' "$cli" "$root/bin/arm-usb"; then
+if grep -n -E 'bash[[:space:]]+-c|sh[[:space:]]+-c|shell=True|os\.system' "$cli" "$root/bin/arm-usb" "$root/bin/supervise"; then
   echo "a shell string would be executed" >&2
   exit 1
 fi
@@ -551,6 +551,21 @@ grep -q 'os.setpgid(0, 0)' "$cli"
 grep -q 'tie_to_parent "$@"' "$cli"
 grep -q -F 'kill -TERM -- -$$' "$cli"
 grep -q -F 'kill -KILL -- -$$' "$cli"
+grep -q '/usr/local/libexec/io.github.07dcolem.target-boot/supervise' "$cli"
+grep -q 'require_supervise' "$cli"
+grep -q 'capture "$PKEXEC" "$SUPERVISE"' "$cli"
+grep -q 'capture "$SUDO" -n -- "$SUPERVISE"' "$cli"
+grep -q 'capture "$SUPERVISE" "$bin"' "$cli"
+grep -q 'os.pidfd_open' "$root/bin/supervise"
+grep -q 'io.github.07dcolem.target-boot.supervise' "$root/polkit/io.github.07dcolem.target-boot.policy"
+if grep -n -E 'capture "\$PKEXEC" "\$bin"|capture "\$SUDO" -n -- "\$bin"|capture "\$bin"' "$cli"; then
+  echo "a privileged program is started without the supervisor" >&2
+  exit 1
+fi
+if grep -n -E 'pkexec.*python3|PKEXEC.*-c' "$cli" "$root/bin/supervise"; then
+  echo "pkexec would run an interpreter from the plugin" >&2
+  exit 1
+fi
 grep -q 'preexec_fn=tie_parent' "$root/bin/arm-usb"
 grep -q 'signal.signal(signal.SIGTERM, _stop_live)' "$root/bin/arm-usb"
 if grep -n 'No startup deadline' "$root/Panel.qml"; then
@@ -607,6 +622,151 @@ else:
     os.kill(child, signal.SIGKILL)
     sys.exit("a tied child survived its parent")
 print("tied child ok")
+PY
+
+# The supervisor is what stays root. Killing the leader has to kill its
+# worker. One case is the parent dying. The other keeps the parent alive and
+# only marks the watched process dead, so the pidfd path has to do the kill.
+python3 -I -S - "$root/bin/supervise" <<'PY'
+import os, signal, subprocess, sys, time
+supervise = sys.argv[1]
+ns = {"__name__": "supervise", "__file__": supervise}
+with open(supervise, "r", encoding="utf-8") as handle:
+    exec(compile(handle.read(), supervise, "exec"), ns)
+
+def run(args):
+    done = subprocess.run([supervise, *args], capture_output=True)
+    if done.returncode == 0:
+        sys.exit("supervise accepted %s" % args)
+
+run(["/usr/bin/true"])
+run(["1"])
+run([])
+
+def children(pid):
+    done = subprocess.run(["ps", "-o", "pid=", "--ppid", str(pid)],
+                          capture_output=True, text=True)
+    return [int(item) for item in done.stdout.split()]
+
+def wait_sleep(pid):
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        for child in children(pid):
+            try:
+                comm = open("/proc/%d/comm" % child, "r", encoding="ascii").read()
+            except OSError:
+                continue
+            if comm.strip() == "sleep":
+                return child
+        time.sleep(0.05)
+    sys.exit("the worker did not start")
+
+def wait_dead(pid):
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            raw = open("/proc/%d/stat" % pid, "rb").read()
+        except OSError:
+            return
+        state = raw.split(b")", 1)[-1].split()[0]
+        if state in (b"Z", b"X"):
+            return
+        time.sleep(0.05)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    sys.exit("a worker survived the leader")
+
+def cleanup(pids):
+    for pid in pids:
+        if not pid:
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+# Parent of the supervisor is the leader. Its death has to kill sleep.
+info_r, info_w = os.pipe()
+token_r, token_w = os.pipe()
+os.write(token_w, b"load-option")
+os.close(token_w)
+leader = os.fork()
+if leader == 0:
+    os.close(info_r)
+    os.setsid()
+    os.dup2(token_r, 0)
+    os.close(token_r)
+    worker = os.fork()
+    if worker == 0:
+        os.close(info_w)
+        os.execv(supervise, [supervise, "/usr/bin/sleep", "30"])
+    os.write(info_w, b"%d\n" % worker)
+    os.close(info_w)
+    os.waitpid(worker, 0)
+    os._exit(0)
+os.close(info_w)
+os.close(token_r)
+sup = int(os.read(info_r, 32).split()[0])
+os.close(info_r)
+worker = None
+try:
+    worker = wait_sleep(sup)
+    fdinfo = open("/proc/%d/fdinfo/0" % sup, "r", encoding="ascii")
+    try:
+        text = fdinfo.read()
+    finally:
+        fdinfo.close()
+    if "pos:\t0" not in text:
+        sys.exit("the supervisor read standard input")
+    os.kill(leader, signal.SIGKILL)
+    wait_dead(worker)
+    wait_dead(sup)
+finally:
+    cleanup((worker, sup, leader))
+    try:
+        os.waitpid(leader, 0)
+    except ChildProcessError:
+        pass
+
+# The parent stays alive. Only the pidfd of a different process trips the kill.
+ready_r, ready_w = os.pipe()
+leader = os.fork()
+if leader == 0:
+    os.close(ready_r)
+    os.close(ready_w)
+    time.sleep(30)
+    os._exit(0)
+watcher = os.fork()
+if watcher == 0:
+    os.close(ready_r)
+    sleep_pid = os.fork()
+    if sleep_pid == 0:
+        os.close(ready_w)
+        os.execv("/usr/bin/sleep", ["sleep", "30"])
+    pidfd = os.pidfd_open(leader)
+    os.write(ready_w, b"1")
+    os.close(ready_w)
+    ns["watch"](pidfd, sleep_pid)
+os.close(ready_w)
+if os.read(ready_r, 1) != b"1":
+    sys.exit("the pidfd watch did not start")
+os.close(ready_r)
+worker = None
+try:
+    worker = wait_sleep(watcher)
+    os.kill(leader, signal.SIGKILL)
+    wait_dead(worker)
+    wait_dead(watcher)
+finally:
+    cleanup((worker, watcher, leader))
+    for pid in (watcher, leader):
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+print("supervise ok")
 PY
 
 # The lead lasts for the whole run. Sample until it exits and require the

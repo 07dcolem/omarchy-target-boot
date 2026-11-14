@@ -1,5 +1,10 @@
 # Changelog
 
+### 1.4.2
+
+- Setting next boot runs a root-owned helper. If the menu is closed or the wait runs out, that helper kills the firmware program, including after the password prompt has started it as root.
+- The menu still lists firmware without the helper. Install the helper once. The partitionless USB helper installs beside it.
+
 ### 1.4.1
 
 - The boot menu stops waiting after 20 seconds. A reboot or a clear of next boot stops waiting after 3 minutes, which leaves time to answer the password prompt, and the menu is usable again after that.
